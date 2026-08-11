@@ -1,0 +1,29 @@
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Compiled TypeScript (regenerate with `npm run build`)
+src/*.js
+src/*.d.ts
+src/*.js.map
+src/*.d.ts.map
+public/app.js
+public/bundle.js
+
+# Server identity key (regenerate: delete and it is recreated)
+dart_server.key
+
+# Build artifacts
+public/*.exe
+public/*.zip
+go/dart-cli
+go/server/server
+rust/target/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

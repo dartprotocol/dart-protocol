@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dart Protocol | Native Desktop</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        body {
+            /* Remove margins and make app draggable by header */
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: var(--bg-color);
+        }
+        .titlebar {
+            -webkit-app-region: drag;
+            height: 38px;
+            background: rgba(10, 10, 12, 0.9);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 1.5rem;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .demo-container {
+            flex-grow: 1;
+            max-width: 900px;
+            margin: 0 auto;
+            width: 100%;
+            padding: 2rem;
+            overflow-y: auto;
+        }
+        .app-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            background: var(--bg-card);
+            padding: 1.5rem;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border);
+        }
+        .app-header h1 {
+            font-size: 1.5rem;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .app-header .client-info {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            display: flex;
+            gap: 1.5rem;
+            align-items: center;
+        }
+        
+        .chat-layout {
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 1.5rem;
+        }
+
+        .chat-main {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .room-controls {
+            display: flex;
+            gap: 0.75rem;
+            background: var(--bg-card);
+            padding: 1rem;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border);
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .room-controls input {
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            color: white;
+            padding: 0.5rem 0.75rem;
+            border-radius: var(--radius-sm);
+            font-family: 'Fira Code', monospace;
+        }
+
+        #chat {
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            height: 350px;
+            overflow-y: auto;
+            padding: 1.5rem;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .msg { color: var(--text-main); }
+        .msg strong { color: #a491ff; }
+        .msg.me strong { color: #10b981; }
+
+        .sys-msg {
+            color: var(--text-muted);
+            text-align: center;
+            font-style: italic;
+            font-size: 0.85rem;
+            margin: 0.5rem 0;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 1rem;
+        }
+
+        .input-group input {
+            flex-grow: 1;
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            color: white;
+            padding: 1rem;
+            border-radius: var(--radius-sm);
+            font-size: 1rem;
+            font-family: inherit;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .input-group input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .sidebar-stats {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 1.5rem;
+            height: fit-content;
+        }
+
+        .sidebar-stats h3 {
+            font-size: 1.1rem;
+            margin-bottom: 1.5rem;
+            color: var(--text-main);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0.75rem;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+
+        .stat-row span:last-child {
+            color: #a491ff;
+            font-family: 'Fira Code', monospace;
+            font-weight: 600;
+        }
+
+        .badge-udp {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border: 1px solid rgba(52, 211, 153, 0.3);
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #383846; }
+
+        /* Override buttons to be not draggable */
+        button, input {
+            -webkit-app-region: no-drag;
+        }
+
+        @media (max-width: 768px) {
+            .chat-layout { grid-template-columns: 1fr; }
+            .app-header { flex-wrap: wrap; gap: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="titlebar">
+        Dart Protocol - Native Client
+    </div>
+
+    <div class="demo-container">
+        <div class="app-header">
+            <h1>Electron App <span class="badge-udp">Native Node UDP</span></h1>
+            <div class="client-info">
+                <span>Client ID: <strong id="myClientId" style="color: #a491ff; font-family: 'Fira Code', monospace;">---</strong></span>
+            </div>
+        </div>
+
+        <div class="chat-layout">
+            <div class="chat-main">
+                <div class="room-controls">
+                    <label for="serverInput" style="color: var(--text-muted); font-size: 0.85rem;">Server IP</label>
+                    <input type="text" id="serverInput" value="daebak.init3.ro" style="width: 140px;" />
+                    
+                    <label for="roomInput" style="color: var(--text-muted); font-size: 0.85rem; margin-left: 0.5rem;">Room</label>
+                    <input type="number" id="roomInput" value="1" min="1" max="65535" style="width: 70px;" />
+                    
+                    <button id="joinBtn" class="btn btn-primary btn-sm" style="margin-left: auto;">Join</button>
+                    <button id="reconnectBtn" class="btn btn-secondary btn-sm">Reconnect</button>
+                </div>
+
+                <div id="chat">
+                    <div class="sys-msg">Initializing Dart Native UDP Client...</div>
+                </div>
+                
+                <div class="input-group">
+                    <input type="text" id="msgInput" placeholder="Type a message to send over raw UDP..." disabled />
+                    <button id="sendBtn" class="btn btn-primary" disabled>
+                        Send Dart
+                    </button>
+                </div>
+            </div>
+
+            <div class="sidebar-stats">
+                <h3>Live Telemetry</h3>
+                <div class="stat-row">
+                    <span>Packets Sent</span>
+                    <span id="pktsSent">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Bytes Transmitted</span>
+                    <span id="bytesSent">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>NACKs Issued</span>
+                    <span id="nacksSent">0</span>
+                </div>
+                <div class="stat-row">
+                    <span>Cache Retransmits</span>
+                    <span id="retransmits">0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        require('../src/electron-gui.js');
+    </script>
+</body>
+</html>
