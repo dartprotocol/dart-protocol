@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io/ioutil"
 )
 
@@ -49,12 +48,14 @@ type DecryptedData struct {
 	Compressed []byte
 	DictFp     []byte
 	Epoch      uint16
+	Idx        uint32
 }
 
 type NackDart struct {
 	Type       uint8
 	ConvId     uint16
-	SenderId   uint16
+	SenderId   uint16 // the member who detected the gap (the signer)
+	TargetId   uint16 // the member whose stream has the gap
 	MissingSeq []uint32
 }
 
@@ -154,14 +155,10 @@ func (c *Codec) getConvKey(convId uint16) ([]byte, error) {
 	return nil, errors.New("no conversation key established")
 }
 
-func (c *Codec) EncodeData(dart *DataDart, dict []byte) ([]byte, error) {
+func (c *Codec) EncodeData(dart *DataDart, dict []byte, messageKey []byte, idx uint32, nonce []byte) ([]byte, error) {
 	epoch := c.CurrentEpochs[dart.ConvId]
 	if epoch == 0 {
 		epoch = 1
-	}
-	convKey := c.RoomKeys[dart.ConvId][epoch]
-	if convKey == nil {
-		return nil, errors.New("no group key established")
 	}
 
 	var compressed bytes.Buffer
@@ -169,33 +166,30 @@ func (c *Codec) EncodeData(dart *DataDart, dict []byte) ([]byte, error) {
 	fw.Write([]byte(dart.Payload))
 	fw.Close()
 
-	// 7-byte cleartext header: type(1) | convId(2) | seq(3) | extLen(1).
-	// The 18-byte extension carries nonce(12) + epoch(2) + dict fingerprint(4).
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	// 7-byte cleartext header + 24-byte cleartext extension (all AAD):
+	//   senderId(2) | nonce(12) | epoch(2) | dictFp(4) | idx(4).
+	// The payload is the deflated message; the key is the sender's per-message
+	// ratchet key (see chain.go).
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 	dictFp := DictFingerprint(dict)
-	epochBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(epochBuf, epoch)
 
-	header := make([]byte, 7)
-	header[0] = dart.Type
-	binary.BigEndian.PutUint16(header[1:3], dart.ConvId)
-	writeUint24(header[3:6], dart.Seq)
-	header[6] = 12 + 2 + DictFpLen // ext len = nonce + epoch + dict fingerprint
+	prefix := make([]byte, 7+24)
+	prefix[0] = dart.Type
+	binary.BigEndian.PutUint16(prefix[1:3], dart.ConvId)
+	writeUint24(prefix[3:6], dart.Seq)
+	prefix[6] = 24
+	binary.BigEndian.PutUint16(prefix[7:9], dart.SenderId)
+	copy(prefix[9:21], nonce)
+	binary.BigEndian.PutUint16(prefix[21:23], epoch)
+	copy(prefix[23:27], dictFp)
+	binary.BigEndian.PutUint32(prefix[27:31], idx)
 
-	aad := make([]byte, 0, len(header)+len(nonce)+len(epochBuf)+len(dictFp))
-	aad = append(aad, header...)
-	aad = append(aad, nonce...)
-	aad = append(aad, epochBuf...)
-	aad = append(aad, dictFp...)
-
-	plaintext := make([]byte, 0, 2+compressed.Len())
-	plaintext = append(plaintext, byte(dart.SenderId>>8), byte(dart.SenderId))
-	plaintext = append(plaintext, compressed.Bytes()...)
-
-	block, err := aes.NewCipher(convKey)
+	block, err := aes.NewCipher(messageKey)
 	if err != nil {
 		return nil, err
 	}
@@ -204,15 +198,15 @@ func (c *Codec) EncodeData(dart *DataDart, dict []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	ciphertext := aesgcm.Seal(nil, nonce, plaintext, aad)
+	ciphertext := aesgcm.Seal(nil, nonce, compressed.Bytes(), prefix)
 
-	res := make([]byte, len(aad)+len(ciphertext))
-	copy(res, aad)
-	copy(res[len(aad):], ciphertext)
+	res := make([]byte, len(prefix)+len(ciphertext))
+	copy(res, prefix)
+	copy(res[len(prefix):], ciphertext)
 	return res, nil
 }
 
-func (c *Codec) DecryptData(buf []byte) (*DecryptedData, error) {
+func (c *Codec) DecryptData(buf []byte, messageKey []byte) (*DecryptedData, error) {
 	if len(buf) < 7 {
 		return nil, errors.New("buffer too short")
 	}
@@ -224,18 +218,15 @@ func (c *Codec) DecryptData(buf []byte) (*DecryptedData, error) {
 	if len(buf) < 7+extLen+16 {
 		return nil, errors.New("invalid payload length")
 	}
-	aad := buf[:7+extLen]
-	nonce := buf[7 : 7+12]
-	epoch := binary.BigEndian.Uint16(buf[7+12 : 7+14])
-	dictFp := buf[7+14 : 7+extLen]
+	prefix := buf[:7+extLen]
+	senderId := binary.BigEndian.Uint16(prefix[7:9])
+	nonce := prefix[9:21]
+	epoch := binary.BigEndian.Uint16(prefix[21:23])
+	dictFp := prefix[23:27]
+	idx := binary.BigEndian.Uint32(prefix[27:31])
 	encryptedWithTag := buf[7+extLen:]
 
-	convKey := c.RoomKeys[convId][epoch]
-	if convKey == nil {
-		return nil, fmt.Errorf("no group key for conv %d epoch %d", convId, epoch)
-	}
-
-	block, err := aes.NewCipher(convKey)
+	block, err := aes.NewCipher(messageKey)
 	if err != nil {
 		return nil, err
 	}
@@ -244,24 +235,20 @@ func (c *Codec) DecryptData(buf []byte) (*DecryptedData, error) {
 		return nil, err
 	}
 
-	plaintext, err := aesgcm.Open(nil, nonce, encryptedWithTag, aad)
+	plaintext, err := aesgcm.Open(nil, nonce, encryptedWithTag, prefix)
 	if err != nil {
 		return nil, err
 	}
-	if len(plaintext) < 2 {
-		return nil, errors.New("invalid plaintext length")
-	}
-
-	senderId := binary.BigEndian.Uint16(plaintext[0:2])
 
 	return &DecryptedData{
 		Type:       typ,
 		ConvId:     convId,
 		SenderId:   senderId,
 		Seq:        seq,
-		Compressed: plaintext[2:],
+		Compressed: plaintext,
 		DictFp:     dictFp,
 		Epoch:      epoch,
+		Idx:        idx,
 	}, nil
 }
 

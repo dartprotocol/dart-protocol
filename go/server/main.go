@@ -222,6 +222,21 @@ func (s *DartGroupServer) removePeer(peerId string) {
 	for _, convId := range leftConvs {
 		if ok {
 			delete(s.members[convId], senderId)
+			// If the creator left, elect a successor (the smallest remaining
+			// senderId) so key rotation continues after the creator is gone.
+			if s.creator[convId] == senderId {
+				if len(s.members[convId]) == 0 {
+					delete(s.creator, convId)
+				} else {
+					successor := uint16(0xFFFF)
+					for sid := range s.members[convId] {
+						if sid < successor {
+							successor = sid
+						}
+					}
+					s.creator[convId] = successor
+				}
+			}
 		}
 		s.notifyMembersLocked(convId)
 	}
@@ -254,7 +269,7 @@ func (s *DartGroupServer) notifyMembersLocked(convId uint16) {
 			Creator:      s.creator[convId] == mSenderId,
 			Members:      roster,
 		}
-		if out, err := s.codec.EncodeMemberInfo(info, transportKey); err == nil {
+		if out, err := s.codec.EncodeMemberInfo(info, transportKey, nil); err == nil {
 			if tp := s.clientMap[convId][mSenderId]; tp != nil {
 				s.sendToPeer(out, tp)
 			}
@@ -366,7 +381,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		actualPeer.PacketCount = 0
 	}
 	actualPeer.PacketCount++
-	if actualPeer.PacketCount > 100 {
+	if actualPeer.PacketCount > 500 {
 		s.mu.Unlock()
 		log.Printf("[Server] Rate limit exceeded for %s. Dropping packet.", peer.ID)
 		return
@@ -419,32 +434,33 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if s.highestSeq[convId] == nil {
 			s.highestSeq[convId] = make(map[uint16]uint32)
 		}
+		_, hasBaseline := s.highestSeq[convId][senderId]
 		currentHighest := s.highestSeq[convId][senderId]
 		
-		// GC Cache
-		minSeq := uint32(1)
-		maxS := seq
-		if currentHighest > maxS {
-			maxS = currentHighest
+		// Modular gap test: 0 = duplicate, >= SeqMod/2 = stale, 1 = exact next.
+		// A fresh server (no baseline yet) treats the first packet as its
+		// baseline so joining mid-conversation (even near a wrap) works.
+		ahead := uint32(1)
+		if hasBaseline {
+			ahead = core.SeqDelta(currentHighest, seq)
 		}
-		if maxS > 200 {
-			minSeq = maxS - 200
+		
+		// GC Cache: keep only the last 200 packets. The reference point is the
+		// modularly-newer of the two, so pruning stays correct across a wrap.
+		ref := seq
+		if ahead >= core.SeqMod/2 {
+			ref = currentHighest
 		}
 		for k := range s.messageCache[convId][senderId] {
-			if k < minSeq {
+			if core.SeqDelta(k, ref) > 200 {
 				delete(s.messageCache[convId][senderId], k)
 			}
 		}
 		
-		var missing []uint32
-		if seq > currentHighest+1 {
-			for i := currentHighest + 1; i < seq; i++ {
-				if _, ok := s.messageCache[convId][senderId][i]; !ok {
-					missing = append(missing, i)
-				}
-			}
-		}
-		if seq > currentHighest {
+		// The server is blind (no group key / no member signing key), so it
+		// does not originate NACKs; loss recovery happens through member-signed
+		// NACKs, which the server repairs from cache or relays verbatim.
+		if ahead > 0 && ahead < core.SeqMod/2 {
 			s.highestSeq[convId][senderId] = seq
 		}
 		
@@ -453,10 +469,6 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		copy(group, s.groups[convId])
 		s.mu.Unlock()
 
-		if len(missing) > 0 {
-			s.sendNack(convId, senderId, missing, actualPeer)
-		}
-		
 		fanned := 0
 		for _, p := range group {
 			if p.ID != actualPeer.ID {
@@ -484,8 +496,8 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		s.mu.Unlock()
 		s.notifyMembers(req.ConvId)
 
-	case core.TypeKeyShare:
-		// Relay the (opaque, encrypted) group-key share to its target.
+	case core.TypeKeyShare, core.TypeChainShare:
+		// Relay the (opaque, encrypted) key / ratchet-chain share to its target.
 		if len(buf) < 7 {
 			return
 		}
@@ -501,7 +513,11 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		}
 
 	case core.TypeNack:
-		nack, err := s.codec.DecodeNack(buf)
+		nackStripped, ok := core.StripControlFrame(buf)
+		if !ok {
+			return
+		}
+		nack, err := s.codec.DecodeNack(nackStripped)
 		if err != nil {
 			return
 		}
@@ -510,7 +526,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		var missingFromServer []uint32
 		var cacheMap map[uint32][]byte
 		if s.messageCache[nack.ConvId] != nil {
-			cacheMap = s.messageCache[nack.ConvId][nack.SenderId]
+			cacheMap = s.messageCache[nack.ConvId][nack.TargetId]
 		}
 		
 		for _, seq := range nack.MissingSeq {
@@ -525,45 +541,41 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		s.mu.Unlock()
 		
 		if len(missingFromServer) > 0 {
+			// Relay the original member-signed NACK verbatim so the target
+			// member (and any peer holding the messages) can act on it.
 			for _, p := range group {
 				if p.ID != actualPeer.ID {
-					s.sendNack(nack.ConvId, nack.SenderId, missingFromServer, p)
+					s.sendToPeer(buf, p)
 				}
 			}
 		}
 
 	case core.TypeSync:
-		sync, err := s.codec.DecodeSync(buf)
+		// The server is keyed into every SYNC (sender -> server). Verify before
+		// relaying so a group member can't forge another member's SYNC.
+		syncConvId := binary.BigEndian.Uint16(buf[1:3])
+		syncSenderId := binary.BigEndian.Uint16(buf[3:5])
+		var memberPub []byte
+		s.mu.Lock()
+		if s.members[syncConvId] != nil {
+			memberPub = s.members[syncConvId][syncSenderId]
+		}
+		s.mu.Unlock()
+		if memberPub == nil {
+			return
+		}
+		key, err := core.PairwiseKey(s.serverECDH, memberPub)
 		if err != nil {
+			return
+		}
+		if _, ok := core.VerifyControlFrame(buf, key); !ok {
 			return
 		}
 		
 		s.mu.Lock()
-		currentHighest := uint32(0)
-		if s.highestSeq[sync.ConvId] != nil {
-			currentHighest = s.highestSeq[sync.ConvId][sync.SenderId]
-		}
-		
-		var missing []uint32
-		if sync.HighestSeq > currentHighest {
-			for i := currentHighest + 1; i <= sync.HighestSeq; i++ {
-				found := false
-				if s.messageCache[sync.ConvId] != nil && s.messageCache[sync.ConvId][sync.SenderId] != nil {
-					_, found = s.messageCache[sync.ConvId][sync.SenderId][i]
-				}
-				if !found {
-					missing = append(missing, i)
-				}
-			}
-		}
-		
-		group := make([]*Peer, len(s.groups[sync.ConvId]))
-		copy(group, s.groups[sync.ConvId])
+		group := make([]*Peer, len(s.groups[syncConvId]))
+		copy(group, s.groups[syncConvId])
 		s.mu.Unlock()
-
-		if len(missing) > 0 {
-			s.sendNack(sync.ConvId, sync.SenderId, missing, actualPeer)
-		}
 		
 		for _, p := range group {
 			if p.ID != actualPeer.ID {
@@ -571,10 +583,30 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 			}
 		}
 
-	case 0x06: // DictReset
+	case 0x06: // DictReset - keyed to the server; verify before relaying so a
+		// group member can't forge another member's Dict-Reset.
+		resetConvId := binary.BigEndian.Uint16(buf[1:3])
+		resetSenderId := binary.BigEndian.Uint16(buf[3:5])
+		var memberPub []byte
 		s.mu.Lock()
-		group := make([]*Peer, len(s.groups[convId]))
-		copy(group, s.groups[convId])
+		if s.members[resetConvId] != nil {
+			memberPub = s.members[resetConvId][resetSenderId]
+		}
+		s.mu.Unlock()
+		if memberPub == nil {
+			return
+		}
+		key, err := core.PairwiseKey(s.serverECDH, memberPub)
+		if err != nil {
+			return
+		}
+		if _, ok := core.VerifyControlFrame(buf, key); !ok {
+			return
+		}
+		
+		s.mu.Lock()
+		group := make([]*Peer, len(s.groups[resetConvId]))
+		copy(group, s.groups[resetConvId])
 		s.mu.Unlock()
 		for _, p := range group {
 			if p.ID != actualPeer.ID {
@@ -596,18 +628,6 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if targetPeer != nil {
 			s.sendToPeer(buf, targetPeer)
 		}
-	}
-}
-
-func (s *DartGroupServer) sendNack(convId uint16, senderId uint16, missingSeq []uint32, peer *Peer) {
-	nack := &core.NackDart{
-		Type:       core.TypeNack,
-		ConvId:     convId,
-		SenderId:   senderId,
-		MissingSeq: missingSeq,
-	}
-	if out, err := s.codec.EncodeNack(nack); err == nil {
-		s.sendToPeer(out, peer)
 	}
 }
 

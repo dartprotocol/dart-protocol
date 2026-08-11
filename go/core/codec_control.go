@@ -8,25 +8,28 @@ import (
 	"errors"
 )
 
-func (c *Codec) EncodeNack(nack *NackDart) ([]byte, error) {
+func (c *Codec) EncodeNack(nack *NackDart, nonce []byte) ([]byte, error) {
 	convKey, err := c.getConvKey(nack.ConvId)
 	if err != nil {
 		return nil, err
 	}
 
-	// 17-byte cleartext header: type(1) | convId(2) | senderId(2) | nonce(12).
-	// A fresh random nonce per packet eliminates the GCM nonce-reuse the old
-	// fixed sentinel IV (0xFFFFFFFE) allowed.
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	// 19-byte cleartext header: type(1) | convId(2) | senderId(2) | targetId(2)
+	// | nonce(12). senderId is the member who detected the gap (the signer);
+	// targetId is the member whose stream has the gap.
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
-	header := make([]byte, 17)
+	header := make([]byte, 19)
 	header[0] = nack.Type
 	binary.BigEndian.PutUint16(header[1:3], nack.ConvId)
 	binary.BigEndian.PutUint16(header[3:5], nack.SenderId)
-	copy(header[5:], nonce)
+	binary.BigEndian.PutUint16(header[5:7], nack.TargetId)
+	copy(header[7:], nonce)
 
 	payload := make([]byte, 2+len(nack.MissingSeq)*3)
 	binary.BigEndian.PutUint16(payload[0:2], uint16(len(nack.MissingSeq)))
@@ -53,15 +56,16 @@ func (c *Codec) EncodeNack(nack *NackDart) ([]byte, error) {
 }
 
 func (c *Codec) DecodeNack(buf []byte) (*NackDart, error) {
-	if len(buf) < 17 {
+	if len(buf) < 19 {
 		return nil, errors.New("buffer too short")
 	}
 	typ := buf[0]
 	convId := binary.BigEndian.Uint16(buf[1:3])
 	senderId := binary.BigEndian.Uint16(buf[3:5])
-	header := buf[:17]
-	nonce := buf[5:17]
-	encrypted := buf[17:]
+	targetId := binary.BigEndian.Uint16(buf[5:7])
+	header := buf[:19]
+	nonce := buf[7:19]
+	encrypted := buf[19:]
 
 	convKey, err := c.getConvKey(convId)
 	if err != nil {
@@ -100,20 +104,23 @@ func (c *Codec) DecodeNack(buf []byte) (*NackDart, error) {
 		Type:       typ,
 		ConvId:     convId,
 		SenderId:   senderId,
+		TargetId:   targetId,
 		MissingSeq: seqs,
 	}, nil
 }
 
-func (c *Codec) EncodeSync(sync *SyncDart) ([]byte, error) {
+func (c *Codec) EncodeSync(sync *SyncDart, nonce []byte) ([]byte, error) {
 	convKey, err := c.getConvKey(sync.ConvId)
 	if err != nil {
 		return nil, err
 	}
 
 	// 17-byte cleartext header: type(1) | convId(2) | senderId(2) | nonce(12).
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
 	header := make([]byte, 17)

@@ -1,13 +1,11 @@
 use rust::core::{
-    codec::{dict_fingerprint, server_fingerprint, Codec},
+    codec::{advance_chain, dict_fingerprint, server_fingerprint, Codec},
     ecdh::ECDH,
-    AckDart, DataDart, DictResetDart, KeyReqDart, KeyShareDart, NackDart, SyncDart,
-    DICT_WINDOW, TYPE_ACK, TYPE_DATA, TYPE_DICT_RESET, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_NACK, TYPE_SYNC,
+    seq_delta, seq_next,
+    AckDart, ChainShareDart, ChainState, DataDart, DecryptedData, DictResetDart, KeyReqDart, KeyShareDart, NackDart, SyncDart,
+    DICT_WINDOW, SEQ_MOD, TYPE_ACK, TYPE_CHAIN_SHARE, TYPE_DATA, TYPE_DICT_RESET, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_NACK, TYPE_SYNC,
 };
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
-};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -48,6 +46,51 @@ impl Transport {
     }
 }
 
+// Per-sender control-frame authentication: HMAC-SHA256 keyed with an ECDH
+// derived pairwise key (SHA-256(ECDH(priv, peerPub))). Only the sender and the
+// intended peer can derive it, so a third member cannot forge a frame.
+type HmacSha256 = Hmac<Sha256>;
+
+fn sign_control(frame: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(frame);
+    let tag = mac.finalize().into_bytes();
+    let mut out = frame.to_vec();
+    out.extend_from_slice(&tag);
+    out
+}
+
+fn verify_control(frame: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 32 {
+        return None;
+    }
+    let (payload, mac) = frame.split_at(frame.len() - 32);
+    let mut m = HmacSha256::new_from_slice(key).ok()?;
+    m.update(payload);
+    let expected = m.finalize().into_bytes();
+    if expected.as_slice() != mac {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn strip_control(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 32 {
+        return None;
+    }
+    Some(frame[..frame.len() - 32].to_vec())
+}
+
+fn pair_key(st: &ClientState, peer_pub: &[u8]) -> Option<Vec<u8>> {
+    st.ecdh.as_ref()?.pairwise_key(peer_pub).ok()
+}
+
+fn sign_for_server(st: &ClientState, frame: &[u8]) -> Option<Vec<u8>> {
+    let server_pub = st.server_pub_key.as_ref()?;
+    let key = pair_key(st, server_pub)?;
+    Some(sign_control(frame, &key))
+}
+
 struct ClientState {
     codec: Codec,
     ecdh: Option<ECDH>,
@@ -64,9 +107,18 @@ struct ClientState {
     nack_timestamps: HashMap<u16, HashMap<u32, Instant>>,
     pending_key_nonce: HashMap<u16, [u8; 16]>,
     server_fingerprint: String,
+    // Server public key (from MEMBER_INFO), used to key the server-verified
+    // SYNC / Dict-Reset frames.
+    server_pub_key: Option<Vec<u8>>,
     roster: HashMap<u16, HashMap<u16, Vec<u8>>>,
     shared_with: HashMap<u16, HashSet<u16>>,
     is_creator: HashMap<u16, bool>,
+
+    // Per-sender ratchet chains: convId -> epoch -> senderId -> chain state.
+    sender_chains: HashMap<u16, HashMap<u16, HashMap<u16, ChainState>>>,
+    chain_shared_with: HashMap<u16, HashSet<u16>>,
+    // Cached per-message keys (and chain index) by seq, for retransmission.
+    message_keys: HashMap<u32, (Vec<u8>, u32)>,
 
     pending_queue: Vec<String>,
     last_send_time: Instant,
@@ -88,9 +140,13 @@ impl ClientState {
             nack_timestamps: HashMap::new(),
             pending_key_nonce: HashMap::new(),
             server_fingerprint: std::env::var("DART_SERVER_FINGERPRINT").unwrap_or_default().trim().to_lowercase(),
+            server_pub_key: None,
             roster: HashMap::new(),
             shared_with: HashMap::new(),
             is_creator: HashMap::new(),
+            sender_chains: HashMap::new(),
+            chain_shared_with: HashMap::new(),
+            message_keys: HashMap::new(),
             pending_queue: Vec::new(),
             last_send_time: Instant::now() - Duration::from_secs(10),
         }
@@ -99,23 +155,27 @@ impl ClientState {
     fn get_dictionary(&self, sender_id: u16, max_seq: u32) -> Vec<u8> {
         // Delta-compress against a bounded window of the SAME sender's history
         // so both sides always build identical dictionaries (and older history
-        // can be pruned).
-        let min_seq = max_seq.saturating_sub(DICT_WINDOW).max(1);
+        // can be pruned). The window is selected in the modular 24-bit space
+        // so it stays correct across a sequence-number wrap.
         let mut msgs = Vec::new();
         if sender_id == self.sender_id {
             for dart in self.sent_messages.values() {
-                if dart.seq >= min_seq && dart.seq < max_seq {
+                let dist = seq_delta(dart.seq, max_seq);
+                if dist >= 1 && dist <= DICT_WINDOW {
                     msgs.push(dart);
                 }
             }
         } else if let Some(map) = self.received_messages.get(&sender_id) {
             for dart in map.values() {
-                if dart.seq >= min_seq && dart.seq < max_seq {
+                let dist = seq_delta(dart.seq, max_seq);
+                if dist >= 1 && dist <= DICT_WINDOW {
                     msgs.push(dart);
                 }
             }
         }
-        msgs.sort_by_key(|d| d.seq);
+        // Oldest-first (largest distance behind max_seq) so all
+        // implementations build byte-identical dictionaries across a wrap.
+        msgs.sort_by_key(|d| std::cmp::Reverse(seq_delta(d.seq, max_seq)));
         let mut res = Vec::new();
         for d in msgs {
             res.extend_from_slice(d.payload.as_bytes());
@@ -125,18 +185,17 @@ impl ClientState {
 
     // Bound memory: drop history older than the dictionary window (+ slack).
     fn prune_sent(&mut self) {
-        let min_seq = self.highest_sent_seq.saturating_sub(DICT_WINDOW + 16).max(1);
-        self.sent_messages.retain(|&seq, _| seq >= min_seq);
+        self.sent_messages.retain(|&seq, _| seq_delta(seq, self.highest_sent_seq) <= DICT_WINDOW + 16);
+        self.message_keys.retain(|&seq, _| seq_delta(seq, self.highest_sent_seq) <= DICT_WINDOW + 16);
     }
 
     fn prune_received(&mut self, sender_id: u16) {
         let highest = self.highest_received.get(&sender_id).copied().unwrap_or(0);
-        let min_seq = highest.saturating_sub(DICT_WINDOW + 16).max(1);
         if let Some(map) = self.received_messages.get_mut(&sender_id) {
-            map.retain(|&seq, _| seq >= min_seq);
+            map.retain(|&seq, _| seq_delta(seq, highest) <= DICT_WINDOW + 16);
         }
         if let Some(map) = self.nack_timestamps.get_mut(&sender_id) {
-            map.retain(|&seq, _| seq >= min_seq);
+            map.retain(|&seq, _| seq_delta(seq, highest) <= DICT_WINDOW + 16);
         }
     }
 }
@@ -289,9 +348,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 st.pending_queue.push(text);
                 continue;
             }
+            let room_id = st.room_id;
+            let (message_key, idx) = match send_step(&mut st, room_id) {
+                Some(pair) => pair,
+                None => {
+                    st.pending_queue.push(text);
+                    continue;
+                }
+            };
 
             let seq = st.next_seq;
-            st.next_seq += 1;
+            st.next_seq = seq_next(st.next_seq);
             let dart = DataDart {
                 conv_id: st.room_id,
                 sender_id: st.sender_id,
@@ -299,11 +366,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload: text,
             };
             st.sent_messages.insert(seq, dart.clone());
+            st.message_keys.insert(seq, (message_key.clone(), idx));
             st.highest_sent_seq = seq;
             st.prune_sent();
 
             let dict = st.get_dictionary(st.sender_id, seq);
-            if let Ok(buf) = st.codec.encode_data(&dart, &dict) {
+            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, None) {
                 transport.send(&buf).await;
                 print!("\x1b[90m[↑] Sending Seq {}...\x1b[0m\r", seq);
                 io::stdout().flush().unwrap();
@@ -339,8 +407,10 @@ async fn send_sync(state: Arc<Mutex<ClientState>>, transport: Transport) {
         sender_id: st.sender_id,
         highest_seq: st.highest_sent_seq,
     };
-    if let Ok(buf) = st.codec.encode_sync(&sync) {
-        let _ = transport.send(&buf).await;
+    if let Ok(buf) = st.codec.encode_sync(&sync, None) {
+        if let Some(signed) = sign_for_server(&st, &buf) {
+            let _ = transport.send(&signed).await;
+        }
     }
 }
 
@@ -381,6 +451,8 @@ fn handle_member_info(
         roster.insert(m.sender_id, m.pub_key.clone());
     }
     st.roster.insert(info.conv_id, roster);
+    st.server_pub_key = Some(server_pub);
+    let prev_creator = *st.is_creator.get(&info.conv_id).unwrap_or(&false);
     st.is_creator.insert(info.conv_id, info.creator);
 
     if st.codec.conv_keys.contains_key(&info.conv_id) {
@@ -389,6 +461,14 @@ fn handle_member_info(
         let key: [u8; 32] = rand::random();
         return adopt_key(st, transport, info.conv_id, 1, key.to_vec());
     }
+    // If I just became the creator (successor election after the previous
+    // creator left), rotate immediately so the departed member loses access.
+    if info.creator && !prev_creator && st.codec.conv_keys.contains_key(&info.conv_id) {
+        rekey(st, transport, info.conv_id);
+    }
+    // Share my ratchet chain with any members that just joined.
+    let epoch = *st.codec.current_epochs.get(&info.conv_id).unwrap_or(&1);
+    share_chain_with_members(st, transport, info.conv_id, epoch);
     None
 }
 
@@ -429,6 +509,153 @@ fn handle_key_share(
     None
 }
 
+// ---- Per-sender ratchet chain management ----
+
+fn get_chain(st: &ClientState, conv_id: u16, epoch: u16, sender_id: u16) -> Option<ChainState> {
+    st.sender_chains.get(&conv_id)?.get(&epoch)?.get(&sender_id).cloned()
+}
+
+fn set_chain(st: &mut ClientState, conv_id: u16, epoch: u16, sender_id: u16, state: ChainState) {
+    st.sender_chains.entry(conv_id).or_default()
+        .entry(epoch).or_default()
+        .insert(sender_id, state);
+}
+
+// Derive a per-message key from my own chain (advancing it) for a send.
+fn send_step(st: &mut ClientState, conv_id: u16) -> Option<(Vec<u8>, u32)> {
+    let epoch = *st.codec.current_epochs.get(&conv_id).unwrap_or(&1);
+    let chain = get_chain(st, conv_id, epoch, st.sender_id)?;
+    let idx = chain.index;
+    let (message_key, state) = advance_chain(&chain, idx);
+    set_chain(st, conv_id, epoch, st.sender_id, state);
+    Some((message_key, idx))
+}
+
+// Generate a fresh chain seed for my own sends in `epoch` and share it with
+// every member (so they can decrypt my future messages).
+fn init_own_chain(st: &mut ClientState, transport: &Transport, conv_id: u16, epoch: u16) {
+    let seed: [u8; 32] = rand::random();
+    set_chain(st, conv_id, epoch, st.sender_id, ChainState { key: seed.to_vec(), index: 0 });
+    st.chain_shared_with.insert(conv_id, HashSet::new());
+    share_chain_with_members(st, transport, conv_id, epoch);
+}
+
+fn share_chain_with_members(st: &mut ClientState, transport: &Transport, conv_id: u16, epoch: u16) {
+    let my_chain = match get_chain(st, conv_id, epoch, st.sender_id) {
+        Some(c) => c,
+        None => return,
+    };
+    let roster = match st.roster.get(&conv_id) {
+        Some(r) => r.clone(),
+        None => return,
+    };
+    let mut targets = Vec::new();
+    {
+        let done = st.chain_shared_with.entry(conv_id).or_default();
+        for m_id in roster.keys() {
+            if *m_id == st.sender_id || done.contains(m_id) {
+                continue;
+            }
+            targets.push(*m_id);
+            done.insert(*m_id);
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let ecdh = st.ecdh.as_ref().unwrap();
+    let mut bufs = Vec::new();
+    for m_id in &targets {
+        let m_pub = &roster[m_id];
+        if let Some(buf) = build_chain_share(st, ecdh, conv_id, epoch, *m_id, m_pub, &my_chain.key, my_chain.index) {
+            bufs.push(buf);
+        }
+    }
+    // Send now, then retry a couple of times with the SAME bytes (idempotent):
+    // the shares go over UDP and a receiver that misses its only copy can
+    // never decrypt this sender's messages.
+    let send_all = {
+        let sock = transport.clone();
+        let bs = bufs.clone();
+        tokio::spawn(async move {
+            for b in bs {
+                let s = sock.clone();
+                tokio::spawn(async move { let _ = s.send(&b).await; });
+            }
+        })
+    };
+    let _ = send_all;
+    for ms in [300u64, 1000] {
+        let bs = bufs.clone();
+        let sock = transport.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(ms)).await;
+            for b in bs {
+                let s = sock.clone();
+                tokio::spawn(async move { let _ = s.send(&b).await; });
+            }
+        });
+    }
+}
+
+fn build_chain_share(
+    st: &ClientState,
+    ecdh: &ECDH,
+    conv_id: u16,
+    epoch: u16,
+    target_id: u16,
+    target_pub: &[u8],
+    chain_key: &[u8],
+    chain_index: u32,
+) -> Option<Vec<u8>> {
+    let shared = ecdh.compute_secret(target_pub).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&shared);
+    let transport_key = hasher.finalize();
+    let share = ChainShareDart {
+        conv_id,
+        sender_id: st.sender_id,
+        target_id,
+        epoch,
+        nonce: rand::random(),
+        chain_key: chain_key.to_vec(),
+        chain_index,
+    };
+    st.codec.encode_chain_share(&share, &transport_key).ok()
+}
+
+fn handle_chain_share(st: &mut ClientState, msg: &[u8]) {
+    if msg.len() < 7 {
+        return;
+    }
+    let conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+    let sender_id = u16::from_be_bytes([msg[3], msg[4]]);
+    let target_id = u16::from_be_bytes([msg[5], msg[6]]);
+    if target_id != st.sender_id {
+        return;
+    }
+    let sharer_pub = match st.roster.get(&conv_id).and_then(|r| r.get(&sender_id)) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+    let ecdh = match st.ecdh.as_ref() {
+        Some(e) => e,
+        None => return,
+    };
+    let shared = match ecdh.compute_secret(&sharer_pub) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&shared);
+    let transport_key = hasher.finalize();
+    let decoded = match st.codec.decode_chain_share(msg, &transport_key) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    set_chain(st, conv_id, decoded.epoch, decoded.sender_id, ChainState { key: decoded.chain_key, index: decoded.chain_index });
+}
+
 fn adopt_key(
     st: &mut ClientState,
     transport: &Transport,
@@ -441,6 +668,8 @@ fn adopt_key(
     st.codec.conv_keys.insert(conv_id, key);
     st.codec.current_epochs.insert(conv_id, epoch);
     st.shared_with.insert(conv_id, HashSet::new());
+    // Start a fresh per-sender ratchet chain for this epoch and share it.
+    init_own_chain(st, transport, conv_id, epoch);
 
     let mut task = None;
     if is_new {
@@ -456,13 +685,15 @@ fn adopt_key(
         st.highest_sent_seq = dart.seq;
         st.prune_sent();
         let dict = st.get_dictionary(st.sender_id, dart.seq);
-        if let Ok(buf) = st.codec.encode_data(&dart, &dict) {
-            let sock = transport.clone();
-            let mut queue = Vec::new();
-            std::mem::swap(&mut queue, &mut st.pending_queue);
-            task = Some(tokio::spawn(async move {
-                let _ = sock.send(&buf).await;
-            }));
+        if let Some((message_key, idx)) = send_step(st, conv_id) {
+            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, None) {
+                let sock = transport.clone();
+                let mut queue = Vec::new();
+                std::mem::swap(&mut queue, &mut st.pending_queue);
+                task = Some(tokio::spawn(async move {
+                    let _ = sock.send(&buf).await;
+                }));
+            }
         }
     }
     share_with_new_members(st, transport, conv_id);
@@ -481,32 +712,62 @@ fn share_with_new_members(st: &mut ClientState, transport: &Transport, conv_id: 
     };
     let mut done = st.shared_with.get(&conv_id).cloned().unwrap_or_default();
     let ecdh = st.ecdh.as_ref().unwrap();
-    for (m_id, m_pub) in roster {
-        if m_id == st.sender_id || done.contains(&m_id) {
+    let mut targets = Vec::new();
+    for (m_id, m_pub) in &roster {
+        if *m_id == st.sender_id || done.contains(m_id) {
             continue;
         }
-        if let Ok(shared) = ecdh.compute_secret(&m_pub) {
+        targets.push((*m_id, m_pub.clone()));
+        done.insert(*m_id);
+    }
+    st.shared_with.insert(conv_id, done);
+    if targets.is_empty() {
+        return;
+    }
+    let mut bufs = Vec::new();
+    for (m_id, m_pub) in &targets {
+        if let Ok(shared) = ecdh.compute_secret(m_pub) {
             let mut hasher = Sha256::new();
             hasher.update(&shared);
             let transport_key = hasher.finalize();
             let share = KeyShareDart {
                 conv_id,
                 sender_id: st.sender_id,
-                target_id: m_id,
+                target_id: *m_id,
                 epoch,
                 nonce: rand::random(),
                 encrypted_key: key.clone(),
             };
             if let Ok(buf) = st.codec.encode_key_share(&share, &transport_key) {
-                let sock = transport.clone();
-                tokio::spawn(async move {
-                    let _ = sock.send(&buf).await;
-                });
+                bufs.push(buf);
             }
-            done.insert(m_id);
         }
     }
-    st.shared_with.insert(conv_id, done);
+    // Send now, then retry a couple of times with the SAME bytes (idempotent):
+    // the group-key share goes over UDP and can be lost; a member that misses
+    // it can't adopt the key or join the room.
+    let send_all = {
+        let sock = transport.clone();
+        let bs = bufs.clone();
+        tokio::spawn(async move {
+            for b in bs {
+                let s = sock.clone();
+                tokio::spawn(async move { let _ = s.send(&b).await; });
+            }
+        })
+    };
+    let _ = send_all;
+    for ms in [300u64, 1000] {
+        let bs = bufs.clone();
+        let sock = transport.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(ms)).await;
+            for b in bs {
+                let s = sock.clone();
+                tokio::spawn(async move { let _ = s.send(&b).await; });
+            }
+        });
+    }
 }
 
 // Forward secrecy: rotate the group key. Old epochs stay decryptable via
@@ -566,31 +827,40 @@ fn process_message_inner(
 
     match typ {
         TYPE_DATA => {
-            let dec = match st.codec.decrypt_data(msg) {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("\x1b[31m[SYSTEM] Packet dropped (decrypt failure or tamper detected): {}\x1b[0m", e);
-                    return None;
-                }
-            };
-            let conv_id = dec.conv_id;
-            let parsed_sender_id = dec.sender_id;
-            let seq = dec.seq;
-            
+            if msg.len() < 7 + 24 || msg[6] < 24 {
+                return None;
+            }
+            let conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+            let seq = (msg[3] as u32) << 16 | (msg[4] as u32) << 8 | (msg[5] as u32);
+            let parsed_sender_id = u16::from_be_bytes([msg[7], msg[8]]);
+
+            let has_baseline = st.highest_received.contains_key(&parsed_sender_id);
             let highest_received = *st.highest_received.get(&parsed_sender_id).unwrap_or(&0);
             
-            if seq <= highest_received {
+            // Modular gap test: 0 = duplicate, >= SEQ_MOD/2 = stale, 1 = exact
+            // next. A receiver with no baseline yet treats the first packet as
+            // its baseline, except when the first seq is within the recoverable
+            // window: then NACK the real gap instead of an out-of-order start.
+            let ahead = if has_baseline {
+                seq_delta(highest_received, seq)
+            } else if seq >= 1 && seq <= DICT_WINDOW {
+                seq
+            } else {
+                1
+            };
+            if ahead == 0 || ahead >= SEQ_MOD / 2 {
                 return None;
             }
 
-            if seq > highest_received + 1 {
+            if ahead > 1 {
                 st.out_of_order_buffer
                     .entry(parsed_sender_id)
                     .or_insert_with(HashMap::new)
                     .insert(seq, msg.to_vec());
                     
                 let mut missing = Vec::new();
-                for i in (highest_received + 1)..seq {
+                for k in 1..ahead {
+                    let i = (highest_received + k) & 0xFFFFFF;
                     let in_buffer = st.out_of_order_buffer.get(&parsed_sender_id).map_or(false, |m| m.contains_key(&i));
                     let in_received = st.received_messages.get(&parsed_sender_id).map_or(false, |m| m.contains_key(&i));
                     
@@ -612,26 +882,62 @@ fn process_message_inner(
                 
                 if !missing.is_empty() {
                     println!("\x1b[33m[SYSTEM] Gap detected. Sent NACK for seqs: {:?}\x1b[0m", missing);
-                    let nack = NackDart { conv_id, sender_id: parsed_sender_id, missing_seq: missing };
-                    if let Ok(buf) = st.codec.encode_nack(&nack) {
-                        let sock = transport.clone();
-                        return Some(tokio::spawn(async move { let _ = sock.send(&buf).await; }));
+                    let nack = NackDart { conv_id, sender_id: st.sender_id, target_id: parsed_sender_id, missing_seq: missing };
+                    if let Ok(buf) = st.codec.encode_nack(&nack, None) {
+                        if let Some(peer_pub) = st.roster.get(&conv_id).and_then(|r| r.get(&parsed_sender_id)).cloned() {
+                            if let Some(key) = pair_key(st, &peer_pub) {
+                                let signed = sign_control(&buf, &key);
+                                let sock = transport.clone();
+                                return Some(tokio::spawn(async move { let _ = sock.send(&signed).await; }));
+                            }
+                        }
                     }
                 }
                 return None;
             }
 
-            return process_data_packet(msg, parsed_sender_id, seq, st, transport);
+            // Exact next packet: decrypt in order, then drain the buffer.
+            return match decrypt_data_in_order(st, msg, parsed_sender_id) {
+                Some(dec) => process_data_packet(msg, dec, parsed_sender_id, seq, st, transport),
+                None => None,
+            };
+        }
+
+        TYPE_CHAIN_SHARE => {
+            handle_chain_share(st, msg);
         }
         
         TYPE_NACK => {
-            if let Ok(nack) = st.codec.decode_nack(msg) {
-                if nack.sender_id == st.sender_id {
-                    println!("\x1b[33m[SYSTEM] Receiver missed seqs {:?}. Sending NACK repairs...\x1b[0m", nack.missing_seq);
-                    for seq in nack.missing_seq {
-                        if let Some(dart) = st.sent_messages.get(&seq) {
+            if msg.len() < 7 {
+                return None;
+            }
+            let nack_conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+            let nack_sender_id = u16::from_be_bytes([msg[3], msg[4]]);
+            let nack_target_id = u16::from_be_bytes([msg[5], msg[6]]);
+            if nack_target_id != st.sender_id {
+                return None;
+            }
+            // Verify the sender's per-sender MAC so a group member can't forge
+            // another member's NACK.
+            let peer_pub = match st.roster.get(&nack_conv_id).and_then(|r| r.get(&nack_sender_id)) {
+                Some(p) => p.clone(),
+                None => return None,
+            };
+            let key = match pair_key(st, &peer_pub) {
+                Some(k) => k,
+                None => return None,
+            };
+            let stripped = match verify_control(msg, &key) {
+                Some(s) => s,
+                None => return None,
+            };
+            if let Ok(nack) = st.codec.decode_nack(&stripped) {
+                println!("\x1b[33m[SYSTEM] Receiver missed seqs {:?}. Sending NACK repairs...\x1b[0m", nack.missing_seq);
+                for seq in nack.missing_seq {
+                    if let Some(dart) = st.sent_messages.get(&seq) {
+                        if let Some((message_key, idx)) = st.message_keys.get(&seq).cloned() {
                             let dict = st.get_dictionary(st.sender_id, seq);
-                            if let Ok(out_buf) = st.codec.encode_data(dart, &dict) {
+                            if let Ok(out_buf) = st.codec.encode_data(dart, &dict, &message_key, idx, None) {
                                 let sock = transport.clone();
                                 tokio::spawn(async move { let _ = sock.send(&out_buf).await; });
                             }
@@ -642,11 +948,21 @@ fn process_message_inner(
         }
         
         TYPE_SYNC => {
-            if let Ok(sync) = st.codec.decode_sync(msg) {
+            // SYNC is keyed to the relay server, which verified and relayed it.
+            let stripped = match strip_control(msg) {
+                Some(s) => s,
+                None => return None,
+            };
+            if let Ok(sync) = st.codec.decode_sync(&stripped) {
+                let has_baseline = st.highest_received.contains_key(&sync.sender_id);
                 let highest_received = *st.highest_received.get(&sync.sender_id).unwrap_or(&0);
-                if sync.highest_seq > highest_received {
+                // Fresh receiver: NACK the whole reported range; otherwise only
+                // the modular distance ahead of what we've seen (handles wraps).
+                let ahead = if has_baseline { seq_delta(highest_received, sync.highest_seq) } else { sync.highest_seq };
+                if ahead > 0 && ahead < SEQ_MOD / 2 {
                     let mut missing = Vec::new();
-                    for i in (highest_received + 1)..=sync.highest_seq {
+                    for k in 1..=ahead {
+                        let i = (highest_received + k) & 0xFFFFFF;
                         let in_buffer = st.out_of_order_buffer.get(&sync.sender_id).map_or(false, |m| m.contains_key(&i));
                         let in_received = st.received_messages.get(&sync.sender_id).map_or(false, |m| m.contains_key(&i));
                         if !in_buffer && !in_received {
@@ -666,21 +982,15 @@ fn process_message_inner(
                     }
                     if !missing.is_empty() {
                         println!("\x1b[33m[SYSTEM] Sync probe revealed gap. Sent NACK for seqs: {:?}\x1b[0m", missing);
-                        let nack = NackDart { conv_id: sync.conv_id, sender_id: sync.sender_id, missing_seq: missing };
-                        if let Ok(buf) = st.codec.encode_nack(&nack) {
-                            let sock = transport.clone();
-                            tokio::spawn(async move { let _ = sock.send(&buf).await; });
-                        }
-                    } else if highest_received == sync.highest_seq {
-                        let ack = AckDart {
-                            conv_id: sync.conv_id,
-                            sender_id: st.sender_id,
-                            target_id: sync.sender_id,
-                            seq: highest_received,
-                        };
-                        if let Ok(buf) = st.codec.encode_ack(&ack) {
-                            let sock = transport.clone();
-                            tokio::spawn(async move { let _ = sock.send(&buf).await; });
+                        let nack = NackDart { conv_id: sync.conv_id, sender_id: st.sender_id, target_id: sync.sender_id, missing_seq: missing };
+                        if let Ok(buf) = st.codec.encode_nack(&nack, None) {
+                            if let Some(peer_pub) = st.roster.get(&sync.conv_id).and_then(|r| r.get(&sync.sender_id)).cloned() {
+                                if let Some(key) = pair_key(st, &peer_pub) {
+                                    let signed = sign_control(&buf, &key);
+                                    let sock = transport.clone();
+                                    tokio::spawn(async move { let _ = sock.send(&signed).await; });
+                                }
+                            }
                         }
                     }
                 }
@@ -688,8 +998,29 @@ fn process_message_inner(
         }
         
         TYPE_ACK => {
-            if let Ok(ack) = st.codec.decode_ack(msg) {
-                if ack.target_id == st.sender_id && ack.seq >= st.highest_sent_seq {
+            if msg.len() < 7 {
+                return None;
+            }
+            let ack_conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+            let ack_sender_id = u16::from_be_bytes([msg[3], msg[4]]);
+            let ack_target_id = u16::from_be_bytes([msg[5], msg[6]]);
+            if ack_target_id != st.sender_id {
+                return None;
+            }
+            let peer_pub = match st.roster.get(&ack_conv_id).and_then(|r| r.get(&ack_sender_id)) {
+                Some(p) => p.clone(),
+                None => return None,
+            };
+            let key = match pair_key(st, &peer_pub) {
+                Some(k) => k,
+                None => return None,
+            };
+            let stripped = match verify_control(msg, &key) {
+                Some(s) => s,
+                None => return None,
+            };
+            if let Ok(ack) = st.codec.decode_ack(&stripped) {
+                if seq_delta(st.highest_sent_seq, ack.seq) < SEQ_MOD / 2 {
                     println!("\x1b[90m[✓] Delivered (Seq {})                                  \x1b[0m", ack.seq);
                 }
             }
@@ -704,7 +1035,12 @@ fn process_message_inner(
         }
         
         TYPE_DICT_RESET => {
-            if let Ok(reset) = st.codec.decode_dict_reset(msg) {
+            // Dict-Reset is keyed to the relay server, which verified it.
+            let stripped = match strip_control(msg) {
+                Some(s) => s,
+                None => return None,
+            };
+            if let Ok(reset) = st.codec.decode_dict_reset(&stripped) {
                 if reset.target_id == st.sender_id {
                     println!("\x1b[31m[SYSTEM] User {} requested a dictionary reset. Flushing history...\x1b[0m", reset.sender_id);
                     st.sent_messages.clear();
@@ -729,7 +1065,8 @@ fn declare_permanent_loss(st: &mut ClientState, transport: &Transport, conv_id: 
     });
     
     let highest = st.highest_received.entry(sender_id).or_insert(0);
-    if lost_seq > *highest {
+    let d = seq_delta(*highest, lost_seq);
+    if d > 0 && d < SEQ_MOD / 2 {
         *highest = lost_seq;
     }
     
@@ -741,25 +1078,45 @@ fn declare_permanent_loss(st: &mut ClientState, transport: &Transport, conv_id: 
         sender_id: st.sender_id,
         target_id: sender_id,
     };
-    if let Ok(buf) = st.codec.encode_dict_reset(&reset) {
-        let sock = transport.clone();
-        tokio::spawn(async move {
-            let _ = sock.send(&buf).await;
-        });
+    if let Ok(buf) = st.codec.encode_dict_reset(&reset, None) {
+        if let Some(signed) = sign_for_server(st, &buf) {
+            let sock = transport.clone();
+            tokio::spawn(async move {
+                let _ = sock.send(&signed).await;
+            });
+        }
+    }
+}
+
+// Decrypts a data packet with the sender's ratchet chain, advancing the chain
+// to the packet's message index. Commits the advanced state only after a
+// successful decrypt.
+fn decrypt_data_in_order(st: &mut ClientState, msg: &[u8], sender_id: u16) -> Option<DecryptedData> {
+    let epoch = u16::from_be_bytes([msg[21], msg[22]]);
+    let idx = u32::from_be_bytes([msg[27], msg[28], msg[29], msg[30]]);
+    let conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+    let chain = get_chain(st, conv_id, epoch, sender_id)?;
+    if idx < chain.index {
+        return None;
+    }
+    let (message_key, state) = advance_chain(&chain, idx);
+    match st.codec.decrypt_data(msg, &message_key) {
+        Ok(dec) => {
+            set_chain(st, conv_id, epoch, sender_id, state);
+            Some(dec)
+        }
+        Err(_) => None,
     }
 }
 
 fn process_data_packet(
-    msg: &[u8], 
+    msg: &[u8],
+    dec: DecryptedData,
     parsed_sender_id: u16, 
     seq: u32, 
     st: &mut ClientState,
     transport: &Transport
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let dec = match st.codec.decrypt_data(msg) {
-        Ok(d) => d,
-        Err(_) => return None,
-    };
     if dec.sender_id != parsed_sender_id {
         return None;
     }
@@ -772,7 +1129,7 @@ fn process_data_packet(
             sender_id: st.sender_id,
             target_id: parsed_sender_id,
         };
-        if let Ok(buf) = st.codec.encode_dict_reset(&reset) {
+        if let Ok(buf) = st.codec.encode_dict_reset(&reset, None) {
             let sock = transport.clone();
             tokio::spawn(async move {
                 let _ = sock.send(&buf).await;
@@ -791,7 +1148,7 @@ fn process_data_packet(
                 sender_id: st.sender_id,
                 target_id: parsed_sender_id,
             };
-            if let Ok(buf) = st.codec.encode_dict_reset(&reset) {
+            if let Ok(buf) = st.codec.encode_dict_reset(&reset, None) {
                 let sock = transport.clone();
                 tokio::spawn(async move {
                     let _ = sock.send(&buf).await;
@@ -807,12 +1164,14 @@ fn process_data_packet(
         payload,
     };
     {
+        let has_baseline = st.highest_received.contains_key(&dart.sender_id);
         let highest = st.highest_received.entry(dart.sender_id).or_insert(0);
         let map = st.received_messages.entry(dart.sender_id).or_insert_with(HashMap::new);
         
         if !map.contains_key(&dart.seq) {
             map.insert(dart.seq, dart.clone());
-            if dart.seq > *highest {
+            let d = if has_baseline { seq_delta(*highest, dart.seq) } else { 1 };
+            if d > 0 && d < SEQ_MOD / 2 {
                 *highest = dart.seq;
             }
             
@@ -823,11 +1182,18 @@ fn process_data_packet(
             }
             
             // Process buffered packets synchronously in this stack frame for simplicity
-            let mut next_seq = *highest + 1;
-            while let Some(buffered) = st.out_of_order_buffer.get_mut(&dart.sender_id).and_then(|m| m.remove(&next_seq)) {
-                let b_dec = match st.codec.decrypt_data(&buffered) {
-                    Ok(d) => d,
-                    Err(_) => break,
+            let mut next_seq = seq_next(*highest);
+            loop {
+                let buffered = {
+                    let buf = st.out_of_order_buffer.get_mut(&dart.sender_id).and_then(|m| m.remove(&next_seq));
+                    match buf {
+                        Some(b) => b,
+                        None => break,
+                    }
+                };
+                let b_dec = match decrypt_data_in_order(st, &buffered, dart.sender_id) {
+                    Some(d) => d,
+                    None => break,
                 };
                 let dict = st.get_dictionary(dart.sender_id, next_seq);
                 if b_dec.dict_fp == dict_fingerprint(&dict) {
@@ -839,7 +1205,9 @@ fn process_data_packet(
                             payload,
                         };
                         st.received_messages.get_mut(&dart.sender_id).unwrap().insert(b_dart.seq, b_dart.clone());
-                        if b_dart.seq > *st.highest_received.get(&dart.sender_id).unwrap() {
+                        let h = *st.highest_received.get(&dart.sender_id).unwrap();
+                        let bd = seq_delta(h, b_dart.seq);
+                        if bd > 0 && bd < SEQ_MOD / 2 {
                             st.highest_received.insert(dart.sender_id, b_dart.seq);
                         }
                         if !b_dart.payload.is_empty() {
@@ -847,7 +1215,7 @@ fn process_data_packet(
                         }
                     }
                 }
-                next_seq += 1;
+                next_seq = seq_next(next_seq);
             }
             
             let sock = transport.clone();
@@ -865,12 +1233,17 @@ fn process_data_packet(
             };
             
             // Schedule the ACK after 200ms
-            if let Ok(buf) = st.codec.encode_ack(&ack) {
-                let sock = transport.clone();
-                return Some(tokio::spawn(async move {
-                    sleep(Duration::from_millis(200)).await;
-                    let _ = sock.send(&buf).await;
-                }));
+            if let Ok(buf) = st.codec.encode_ack(&ack, None) {
+                if let Some(peer_pub) = st.roster.get(&dart.conv_id).and_then(|r| r.get(&dart.sender_id)).cloned() {
+                    if let Some(key) = pair_key(st, &peer_pub) {
+                        let signed = sign_control(&buf, &key);
+                        let sock = transport.clone();
+                        return Some(tokio::spawn(async move {
+                            sleep(Duration::from_millis(200)).await;
+                            let _ = sock.send(&signed).await;
+                        }));
+                    }
+                }
             }
         }
     }

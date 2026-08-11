@@ -2,6 +2,7 @@ use p256::{
     ecdh::diffie_hellman,
     PublicKey, SecretKey,
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct ECDH {
@@ -37,5 +38,14 @@ impl ECDH {
         let shared = diffie_hellman(self.secret.to_nonzero_scalar(), peer_pub.as_affine());
         let secret_bytes = shared.raw_secret_bytes();
         Ok(secret_bytes.to_vec())
+    }
+
+    // Derives the per-sender MAC key shared with a peer: SHA-256(ECDH(priv,
+    // peerPub)). Both sides compute the same value from their own private key,
+    // so a third member cannot derive it and cannot forge the other member's
+    // control frames.
+    pub fn pairwise_key(&self, peer_pub_key_bytes: &[u8]) -> Result<Vec<u8>, String> {
+        let secret = self.compute_secret(peer_pub_key_bytes)?;
+        Ok(Sha256::digest(&secret).to_vec())
     }
 }

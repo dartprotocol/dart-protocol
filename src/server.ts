@@ -5,7 +5,7 @@ import * as fs from 'fs';
 const express = require('express');
 import * as WebSocket from 'ws';
 import * as crypto from 'crypto';
-import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, DataDart, NackDart, SyncDart, KeyReqDart, MemberInfo } from './core';
+import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_CHAIN_SHARE, TYPE_MEMBER_INFO, DataDart, NackDart, SyncDart, KeyReqDart, MemberInfo, seqDelta, SEQ_MOD, pairwiseKey, verifyControlFrame, stripControlFrame } from './core';
 
 interface Peer {
     id: string; // "ip:port" or "tcp:..." or "ws:..."
@@ -143,8 +143,9 @@ export class DartGroupServer {
         const leftConvs: number[] = [];
         for (const [convId, group] of this.groups.entries()) {
             const before = group.length;
-            this.groups.set(convId, group.filter(p => p.id !== peerId));
-            if (group.length !== before) {
+            const filtered = group.filter(p => p.id !== peerId);
+            this.groups.set(convId, filtered);
+            if (filtered.length !== before) {
                 leftConvs.push(convId);
             }
         }
@@ -155,6 +156,19 @@ export class DartGroupServer {
             const mems = this.members.get(convId);
             if (mems && senderId !== undefined) {
                 mems.delete(senderId);
+                // If the creator left, elect a successor (the smallest remaining
+                // senderId) so key rotation continues after the creator is gone.
+                if (this.creator.get(convId) === senderId) {
+                    if (mems.size === 0) {
+                        this.creator.delete(convId);
+                    } else {
+                        let successor = Infinity;
+                        for (const [mId] of mems) {
+                            if (mId < successor) successor = mId;
+                        }
+                        this.creator.set(convId, successor);
+                    }
+                }
                 this.notifyMembers(convId);
             }
         }
@@ -208,7 +222,7 @@ export class DartGroupServer {
              peer.packetCount = 0;
         }
         peer.packetCount++;
-        if (peer.packetCount > 100) {
+        if (peer.packetCount > 500) {
              console.log(`[Server] Rate limit exceeded for ${peer.id}. Dropping packet.`);
              return; // Drop packet to prevent flood
         }
@@ -248,25 +262,27 @@ export class DartGroupServer {
                 cacheMap.set(seq, buf);
                 
                 if (!this.highestSeq.has(convId)) this.highestSeq.set(convId, new Map());
+                const hasBaseline = this.highestSeq.get(convId)!.has(senderId);
                 const currentHighest = this.highestSeq.get(convId)!.get(senderId) || 0;
                 
-                // GC Sliding Window: keep only the last 200 packets to prevent memory leaks
-                const minSeq = Math.max(1, Math.max(seq, currentHighest) - 200);
+                // Modular gap test: 0 = duplicate, >= SEQ_MOD/2 = stale, 1 = exact next.
+                // A fresh server (no baseline yet) treats the first packet as baseline.
+                const ahead = hasBaseline ? seqDelta(currentHighest, seq) : 1;
+                
+                // GC Sliding Window: keep only the last 200 packets to prevent memory leaks.
+                // The reference point is the modularly-newer of the two, so pruning
+                // stays correct across a wrap.
+                const ref = ahead >= SEQ_MOD / 2 ? currentHighest : seq;
                 for (const k of cacheMap.keys()) {
-                    if (k < minSeq) cacheMap.delete(k);
+                    if (seqDelta(k, ref) > 200) cacheMap.delete(k);
                 }
                 
-                if (seq > currentHighest + 1) {
-                    const missing = [];
-                    for (let i = currentHighest + 1; i < seq; i++) {
-                        if (!this.messageCache.get(convId)!.get(senderId)!.has(i)) missing.push(i);
-                    }
-                    if (missing.length > 0) {
-                        this.sendNack(convId, senderId, missing, peer);
-                    }
-                }
+                // The server is blind (no group key / no member signing key), so
+                // it does not originate NACKs; loss recovery happens through
+                // member-signed NACKs, which the server repairs from cache or
+                // relays verbatim.
                 
-                if (seq > currentHighest) {
+                if (ahead > 0 && ahead < SEQ_MOD / 2) {
                     this.highestSeq.get(convId)!.set(senderId, seq);
                 }
                 
@@ -295,8 +311,8 @@ export class DartGroupServer {
 
                 // Notify every member (including the joiner) with the roster.
                 this.notifyMembers(req.convId);
-            } else if (type === TYPE_KEY_SHARE) {
-                // Relay the (opaque, encrypted) group-key share to its target.
+            } else if (type === TYPE_KEY_SHARE || type === TYPE_CHAIN_SHARE) {
+                // Relay the (opaque, encrypted) key / ratchet-chain share to its target.
                 const targetId = buf.readUInt16BE(5);
                 const targetPeer = this.clientMap.get(convId)?.get(targetId);
                 if (targetPeer) {
@@ -304,11 +320,13 @@ export class DartGroupServer {
                 }
             } else if (type === TYPE_NACK) {
                 this.stats.nacksReceived++;
-                const nack = Codec.decodeNack(buf);
+                const nackStripped = stripControlFrame(buf);
+                if (!nackStripped) return;
+                const nack = Codec.decodeNack(nackStripped);
                 
                 const missingFromServer = [];
                 for (const seq of nack.missingSeq) {
-                    const cached = this.messageCache.get(nack.convId)?.get(nack.senderId)?.get(seq);
+                    const cached = this.messageCache.get(nack.convId)?.get(nack.targetId)?.get(seq);
                     if (cached) {
                         this.stats.repairsSent++;
                         this.sendToPeer(cached, peer);
@@ -318,34 +336,39 @@ export class DartGroupServer {
                 }
                 
                 if (missingFromServer.length > 0) {
+                    // Relay the original member-signed NACK verbatim so the
+                    // target member (and any peer holding the messages) can act
+                    // on it; the target verifies the sender's per-sender MAC.
                     for (const p of (this.groups.get(nack.convId) || [])) {
                         if (p.id !== peer.id) {
-                            this.sendNack(nack.convId, nack.senderId, missingFromServer, p);
+                            this.sendToPeer(buf, p);
                         }
                     }
                 }
             } else if (type === TYPE_SYNC) {
-                const sync = Codec.decodeSync(buf);
-                const group = this.groups.get(sync.convId) || [];
+                // The server is keyed into every SYNC (sender -> server). Verify
+                // before relaying so a group member can't forge another member's
+                // SYNC to trigger a NACK storm.
+                const syncSenderId = buf.readUInt16BE(3);
+                const memberPub = this.members.get(convId)?.get(syncSenderId);
+                const syncVerified = memberPub ? verifyControlFrame(buf, pairwiseKey(this.serverECDH, memberPub)) : null;
+                if (!syncVerified) return;
                 
-                const currentHighest = this.highestSeq.get(sync.convId)?.get(sync.senderId) || 0;
-                if (sync.highestSeq > currentHighest) {
-                    const missing = [];
-                    for (let i = currentHighest + 1; i <= sync.highestSeq; i++) {
-                        if (!this.messageCache.get(sync.convId)?.get(sync.senderId)?.has(i)) missing.push(i);
-                    }
-                    if (missing.length > 0) {
-                        this.sendNack(sync.convId, sync.senderId, missing, peer);
-                    }
-                }
-                
+                const group = this.groups.get(convId) || [];
                 for (const p of group) {
                     if (p.id !== peer.id) {
                         this.sendToPeer(buf, p);
                     }
                 }
             } else if (type === 0x06) {
-                // TYPE_DICT_RESET
+                // TYPE_DICT_RESET - keyed to the server (sender -> server).
+                // Verify before relaying so a group member can't forge another
+                // member's Dict-Reset (which wipes that member's history).
+                const resetSenderId = buf.readUInt16BE(3);
+                const memberPub = this.members.get(convId)?.get(resetSenderId);
+                const resetVerified = memberPub ? verifyControlFrame(buf, pairwiseKey(this.serverECDH, memberPub)) : null;
+                if (!resetVerified) return;
+                
                 console.log(`[Server] DictReset Conv:${convId}`);
                 const group = this.groups.get(convId) || [];
                 for (const p of group) {
@@ -366,17 +389,21 @@ export class DartGroupServer {
         }
     }
     
-    private sendNack(convId: number, senderId: number, missingSeq: number[], peer: Peer) {
-        this.stats.nacksSent++;
-        const nack: NackDart = { type: TYPE_NACK, convId, senderId, missingSeq };
-        const buf = Codec.encodeNack(nack);
-        this.sendToPeer(buf, peer);
-    }
-    
     close() {
         this.udpSocket.close();
         this.tcpServer.close();
         this.wss.close();
         this.httpServer.close();
     }
+}
+
+// Run directly (node src/server.js) to start the standalone server. The
+// DartGroupServer constructor generates (and persists) the long-term identity
+// key into dart_server.key on first boot and prints the pin fingerprint.
+if (require.main === module) {
+  const server = new DartGroupServer(9000);
+  console.log("UDP Server listening on 9000");
+  console.log("TCP Server listening on 9001");
+  console.log("HTTP / WebSocket Server listening on 9002");
+  console.log("\nOpen http://localhost:9002 in two browser tabs to chat!");
 }

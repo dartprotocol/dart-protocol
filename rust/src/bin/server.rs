@@ -1,13 +1,11 @@
 use rust::core::{
     codec::{server_fingerprint, Codec},
     ecdh::ECDH,
-    Member, MemberInfo, NackDart,
-    TYPE_ACK, TYPE_DATA, TYPE_DICT_RESET, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_NACK, TYPE_SYNC,
+    seq_delta,
+    Member, MemberInfo,
+    SEQ_MOD, TYPE_ACK, TYPE_CHAIN_SHARE, TYPE_DATA, TYPE_DICT_RESET, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_NACK, TYPE_SYNC,
 };
-use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
-    Aes256Gcm, Nonce,
-};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,6 +22,33 @@ use rand::Rng;
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+
+// Per-sender control-frame authentication: HMAC-SHA256 keyed with an ECDH
+// derived pairwise key. The server is keyed into every SYNC / Dict-Reset frame
+// (sender -> server) and verifies them before relaying, so a group member
+// can't forge another member's broadcast control frames.
+type HmacSha256 = Hmac<Sha256>;
+
+fn verify_control(frame: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 32 {
+        return None;
+    }
+    let (payload, mac) = frame.split_at(frame.len() - 32);
+    let mut m = HmacSha256::new_from_slice(key).ok()?;
+    m.update(payload);
+    let expected = m.finalize().into_bytes();
+    if expected.as_slice() != mac {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn strip_control(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 32 {
+        return None;
+    }
+    Some(frame[..frame.len() - 32].to_vec())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PeerId {
@@ -297,6 +322,17 @@ async fn cleanup_peer(peer_id: &PeerId, state: &Arc<RwLock<ServerState>>, socket
                 if let Some(mems) = s.members.get_mut(conv) {
                     mems.remove(&sid);
                 }
+                // If the creator left, elect a successor (the smallest remaining
+                // senderId) so key rotation continues after the creator is gone.
+                if s.creator.get(conv) == Some(&sid) {
+                    let remaining: Vec<u16> = s.members.get(conv).map(|m| m.keys().copied().collect()).unwrap_or_default();
+                    if remaining.is_empty() {
+                        s.creator.remove(conv);
+                    } else {
+                        let successor = remaining.into_iter().min().unwrap();
+                        s.creator.insert(*conv, successor);
+                    }
+                }
             }
         }
         convs
@@ -364,7 +400,7 @@ async fn notify_members(conv_id: u16, state: &Arc<RwLock<ServerState>>, socket: 
             members: roster.clone(),
         };
         let codec = Codec::new();
-        if let Ok(out) = codec.encode_member_info(&info, &transport_key) {
+        if let Ok(out) = codec.encode_member_info(&info, &transport_key, None) {
             let target = {
                 let s = state.read().await;
                 s.client_map.get(&conv_id).and_then(|m| m.get(&m_sender_id)).cloned()
@@ -395,7 +431,7 @@ async fn handle_message(
             entry.1 = 0;
         }
         entry.1 += 1;
-        if entry.1 > 100 {
+        if entry.1 > 500 {
             return;
         }
     }
@@ -445,32 +481,32 @@ async fn handle_message(
             let seq = (msg[3] as u32) << 16 | (msg[4] as u32) << 8 | (msg[5] as u32);
             println!("[Server] DataDart Conv:{} Sender:{} Seq:{}", conv_id, sender_id, seq);
 
-            let mut missing = Vec::new();
             let mut group = Vec::new();
             
             {
                 let mut s = state.write().await;
                 
+                let has_baseline = s.highest_seq.get(&conv_id).map_or(false, |m| m.contains_key(&sender_id));
                 let current_highest = *s.highest_seq.entry(conv_id).or_default().entry(sender_id).or_default();
                 s.message_cache.entry(conv_id).or_default().entry(sender_id).or_default().insert(seq, msg.clone());
 
-                let min_seq = if current_highest > seq {
-                    if current_highest > 200 { current_highest - 200 } else { 1 }
-                } else {
-                    if seq > 200 { seq - 200 } else { 1 }
-                };
-                
-                s.message_cache.get_mut(&conv_id).unwrap().get_mut(&sender_id).unwrap().retain(|&k, _| k >= min_seq);
+                // Modular gap test: 0 = duplicate, >= SEQ_MOD/2 = stale, 1 = exact
+                // next. A fresh server (no baseline yet) treats the first packet
+                // as its baseline so joining mid-conversation (even near a wrap)
+                // still works.
+                let ahead = if has_baseline { seq_delta(current_highest, seq) } else { 1 };
 
-                if seq > current_highest + 1 {
-                    let cache = s.message_cache.get(&conv_id).unwrap().get(&sender_id).unwrap();
-                    for i in (current_highest + 1)..seq {
-                        if !cache.contains_key(&i) {
-                            missing.push(i);
-                        }
-                    }
-                }
-                if seq > current_highest {
+                // GC: keep the last 200 packets around the modularly-newer seq
+                // so pruning stays correct across a wrap.
+                let ref_seq = if ahead >= SEQ_MOD / 2 { current_highest } else { seq };
+                let cache = s.message_cache.get_mut(&conv_id).unwrap().get_mut(&sender_id).unwrap();
+                cache.retain(|&k, _| seq_delta(k, ref_seq) <= 200);
+
+                // The server is blind (no group key / no member signing key), so
+                // it does not originate NACKs; loss recovery happens through
+                // member-signed NACKs, which the server repairs from cache or
+                // relays verbatim.
+                if ahead > 0 && ahead < SEQ_MOD / 2 {
                     s.highest_seq.get_mut(&conv_id).unwrap().insert(sender_id, seq);
                 }
 
@@ -481,10 +517,6 @@ async fn handle_message(
                         }
                     }
                 }
-            }
-
-            if !missing.is_empty() {
-                send_nack(conv_id, sender_id, missing, &peer_id, &codec, &state, &socket).await;
             }
 
             for p in group {
@@ -513,8 +545,8 @@ async fn handle_message(
             notify_members(req.conv_id, &state, &socket).await;
         }
 
-        TYPE_KEY_SHARE => {
-            // Relay the (opaque, encrypted) group-key share to its target.
+        TYPE_KEY_SHARE | TYPE_CHAIN_SHARE => {
+            // Relay the (opaque, encrypted) key / ratchet-chain share to its target.
             if msg.len() < 7 {
                 return;
             }
@@ -529,11 +561,15 @@ async fn handle_message(
         }
 
         TYPE_NACK => {
-            let nack = match codec.decode_nack(&msg) {
+            let stripped = match strip_control(&msg) {
+                Some(s) => s,
+                None => return,
+            };
+            let nack = match codec.decode_nack(&stripped) {
                 Ok(n) => n,
                 Err(_) => return,
             };
-            println!("[Server] NACK Conv:{} Sender:{} Missing:{:?} from Peer", nack.conv_id, nack.sender_id, nack.missing_seq);
+            println!("[Server] NACK Conv:{} Sender:{} Target:{} Missing:{:?} from Peer", nack.conv_id, nack.sender_id, nack.target_id, nack.missing_seq);
 
             let mut missing_from_server = Vec::new();
             let mut to_send = Vec::new();
@@ -542,7 +578,7 @@ async fn handle_message(
             {
                 let s = state.read().await;
                 if let Some(cache_room) = s.message_cache.get(&nack.conv_id) {
-                    if let Some(cache_sender) = cache_room.get(&nack.sender_id) {
+                    if let Some(cache_sender) = cache_room.get(&nack.target_id) {
                         for seq in &nack.missing_seq {
                             if let Some(cached) = cache_sender.get(seq) {
                                 to_send.push(cached.clone());
@@ -572,48 +608,41 @@ async fn handle_message(
             }
 
             if !missing_from_server.is_empty() {
-                println!("[Server] Forwarding NACK for missing seqs {:?}", missing_from_server);
+                // Relay the original member-signed NACK verbatim so the target
+                // member (and any peer holding the messages) can act on it.
+                println!("[Server] Relaying NACK for missing seqs {:?}", missing_from_server);
                 for p in group {
-                    send_nack(nack.conv_id, nack.sender_id, missing_from_server.clone(), &p, &codec, &state, &socket).await;
+                    send_to_peer(&msg, &p, &state, &socket).await;
                 }
             }
         }
 
         TYPE_SYNC => {
-            let sync = match codec.decode_sync(&msg) {
-                Ok(s) => s,
+            // The server is keyed into every SYNC (sender -> server). Verify
+            // before relaying so a group member can't forge another member's
+            // SYNC.
+            let sync_conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+            let sync_sender_id = u16::from_be_bytes([msg[3], msg[4]]);
+            let member_pub = {
+                let s = state.read().await;
+                s.members.get(&sync_conv_id).and_then(|m| m.get(&sync_sender_id)).cloned()
+            };
+            let member_pub = match member_pub {
+                Some(p) => p,
+                None => return,
+            };
+            let key = match state.read().await.ecdh.pairwise_key(&member_pub) {
+                Ok(k) => k,
                 Err(_) => return,
             };
+            if verify_control(&msg, &key).is_none() {
+                return;
+            }
 
-            let mut missing = Vec::new();
             let mut group = Vec::new();
-
             {
                 let s = state.read().await;
-                let mut current_highest = 0;
-                if let Some(room_highest) = s.highest_seq.get(&sync.conv_id) {
-                    if let Some(&h) = room_highest.get(&sync.sender_id) {
-                        current_highest = h;
-                    }
-                }
-
-                if sync.highest_seq > current_highest {
-                    for i in (current_highest + 1)..=sync.highest_seq {
-                        let mut found = false;
-                        if let Some(cache_room) = s.message_cache.get(&sync.conv_id) {
-                            if let Some(cache_sender) = cache_room.get(&sync.sender_id) {
-                                if cache_sender.contains_key(&i) {
-                                    found = true;
-                                }
-                            }
-                        }
-                        if !found {
-                            missing.push(i);
-                        }
-                    }
-                }
-
-                if let Some(room_peers) = s.rooms.get(&sync.conv_id) {
+                if let Some(room_peers) = s.rooms.get(&sync_conv_id) {
                     for p in room_peers {
                         if *p != peer_id {
                             group.push(p.clone());
@@ -621,21 +650,36 @@ async fn handle_message(
                     }
                 }
             }
-
-            if !missing.is_empty() {
-                send_nack(sync.conv_id, sync.sender_id, missing, &peer_id, &codec, &state, &socket).await;
-            }
-
             for p in group {
                 send_to_peer(&msg, &p, &state, &socket).await;
             }
         }
 
         TYPE_DICT_RESET => {
+            // Keyed to the server (sender -> server); verify before relaying so
+            // a group member can't forge another member's Dict-Reset.
+            let reset_conv_id = u16::from_be_bytes([msg[1], msg[2]]);
+            let reset_sender_id = u16::from_be_bytes([msg[3], msg[4]]);
+            let member_pub = {
+                let s = state.read().await;
+                s.members.get(&reset_conv_id).and_then(|m| m.get(&reset_sender_id)).cloned()
+            };
+            let member_pub = match member_pub {
+                Some(p) => p,
+                None => return,
+            };
+            let key = match state.read().await.ecdh.pairwise_key(&member_pub) {
+                Ok(k) => k,
+                Err(_) => return,
+            };
+            if verify_control(&msg, &key).is_none() {
+                return;
+            }
+
             let mut group = Vec::new();
             {
                 let s = state.read().await;
-                if let Some(room_peers) = s.rooms.get(&conv_id) {
+                if let Some(room_peers) = s.rooms.get(&reset_conv_id) {
                     for p in room_peers {
                         if *p != peer_id {
                             group.push(p.clone());
@@ -668,24 +712,5 @@ async fn handle_message(
         }
 
         _ => {}
-    }
-}
-
-async fn send_nack(
-    conv_id: u16,
-    sender_id: u16,
-    missing_seq: Vec<u32>,
-    peer: &PeerId,
-    codec: &Codec,
-    state: &Arc<RwLock<ServerState>>,
-    socket: &Arc<UdpSocket>,
-) {
-    let nack = NackDart {
-        conv_id,
-        sender_id,
-        missing_seq,
-    };
-    if let Ok(out) = codec.encode_nack(&nack) {
-        send_to_peer(&out, peer, state, socket).await;
     }
 }

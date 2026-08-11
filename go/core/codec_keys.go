@@ -103,15 +103,17 @@ func MemberInfoServerKey(buf []byte) ([]byte, error) {
 	return buf[5:70], nil
 }
 
-func (c *Codec) EncodeMemberInfo(info *MemberInfo, transportKey []byte) ([]byte, error) {
+func (c *Codec) EncodeMemberInfo(info *MemberInfo, transportKey []byte, nonce []byte) ([]byte, error) {
 	header := make([]byte, 5)
 	header[0] = info.Type
 	binary.BigEndian.PutUint16(header[1:3], info.ConvId)
 	binary.BigEndian.PutUint16(header[3:5], info.SenderId)
 
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
 	creatorFlag := byte(0)
@@ -205,7 +207,7 @@ func (c *Codec) DecodeMemberInfo(buf []byte, transportKey []byte) (*MemberInfo, 
 	}, nil
 }
 
-func (c *Codec) EncodeDictReset(reset *DictResetDart) ([]byte, error) {
+func (c *Codec) EncodeDictReset(reset *DictResetDart, nonce []byte) ([]byte, error) {
 	convKey, err := c.getConvKey(reset.ConvId)
 	if err != nil {
 		return nil, err
@@ -213,9 +215,11 @@ func (c *Codec) EncodeDictReset(reset *DictResetDart) ([]byte, error) {
 
 	// 19-byte cleartext header: type(1) | convId(2) | senderId(2) | targetId(2)
 	// | nonce(12). The whole header is the AEAD AAD, so an outsider can't forge a reset.
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
 	header := make([]byte, 19)
@@ -279,7 +283,7 @@ func (c *Codec) DecodeDictReset(buf []byte) (*DictResetDart, error) {
 	}, nil
 }
 
-func (c *Codec) EncodeAck(ack *AckDart) ([]byte, error) {
+func (c *Codec) EncodeAck(ack *AckDart, nonce []byte) ([]byte, error) {
 	convKey, err := c.getConvKey(ack.ConvId)
 	if err != nil {
 		return nil, err
@@ -288,9 +292,11 @@ func (c *Codec) EncodeAck(ack *AckDart) ([]byte, error) {
 	// 22-byte cleartext header: type(1) | convId(2) | senderId(2) | targetId(2)
 	// | seq(3) | nonce(12). The whole header is the AEAD AAD, so an outsider
 	// can't forge a delivery confirmation.
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if nonce == nil {
+		nonce = make([]byte, 12)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
 	}
 
 	header := make([]byte, 22)

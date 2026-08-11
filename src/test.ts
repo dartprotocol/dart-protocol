@@ -1,6 +1,6 @@
 import { DartClient } from './client';
 import { DartGroupServer } from './server';
-import { Codec } from './core';
+import { Codec, SEQ_MOD, TYPE_NACK, pairwiseKey, signControlFrame, currentEpochs, advanceChain, chainMessageKey, chainNextKey } from './core';
 
 async function delay(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -86,10 +86,131 @@ async function runTests() {
   console.log("Client B packets received:", clientB.stats.packetsReceived);
   console.log("Expected: B received the message via TCP without losing state.");
   
+  // --- Test 4: 24-bit sequence-number wrap (0xFFFFFF -> 0 -> 1 ...) ---
+  console.log("--- Test 4: Sequence-number wrap across the 24-bit boundary ---");
+  const clientE = new DartClient(8005);
+  const clientF = new DartClient(8006);
+  clientE.addPeer('127.0.0.1', 9000);
+  clientF.addPeer('127.0.0.1', 9000);
+  clientE.setServerFingerprint(serverFp);
+  clientF.setServerFingerprint(serverFp);
+  server.joinGroup(2, { id: 'udp:127.0.0.1:8005', type: 'udp', address: '127.0.0.1', port: 8005 });
+  server.joinGroup(2, { id: 'udp:127.0.0.1:8006', type: 'udp', address: '127.0.0.1', port: 8006 });
+  clientE.joinConversation(2);
+  clientF.joinConversation(2);
+  await delay(200);
+
+  // Wind E's counter to just before the wrap so its first message is the 24-bit
+  // maximum and the following ones wrap through 0.
+  (clientE as any).nextSeq = SEQ_MOD - 1;
+
+  const wrapPayloads = ["wrap-FFFFFE?no-max", "wrap-0", "wrap-1", "wrap-2", "wrap-3", "wrap-4", "wrap-5"];
+  for (let i = 0; i < wrapPayloads.length; i++) {
+    clientE.sendData(2, wrapPayloads[i]);
+    await delay(60);
+  }
+  await delay(600);
+
+  const received = (clientF as any).receivedMessages.get(clientE.senderId) || new Map();
+  const expected = [SEQ_MOD - 1, 0, 1, 2, 3, 4, 5];
+  let wrapOk = true;
+  for (let i = 0; i < expected.length; i++) {
+    const dart = received.get(expected[i]);
+    const ok = dart && dart.payload === wrapPayloads[i];
+    if (!ok) wrapOk = false;
+    console.log(`  seq 0x${expected[i].toString(16)} payload=${dart ? JSON.stringify(dart.payload) : 'MISSING'} ${ok ? 'OK' : 'FAIL'}`);
+  }
+  console.log(wrapOk ? "Wrap test PASS" : "Wrap test FAIL");
+
+  // --- Test 5: Per-sender control-frame auth (forgery resistance) ---
+  console.log("--- Test 5: Control-frame forgery resistance ---");
+  clientA.sendData(1, "forge-me");
+  await delay(150);
+  (clientA as any).stats.retransmits = 0;
+
+  const aPub = (clientB as any).roster.get(1).get(clientA.senderId);
+  const aPort = clientA.port;
+  const sendUdp = (buf: Buffer) => (clientB as any).socket.send(buf, aPort, '127.0.0.1', () => {});
+
+  // B forges a NACK claiming to be C, targeting A, for a message A sent.
+  // B signs it with B's own key; A verifies against C's key -> must reject.
+  const forgedNack = { type: TYPE_NACK, convId: 1, senderId: clientC.senderId, targetId: clientA.senderId, missingSeq: [1] };
+  const forgedBuf = Codec.encodeNack(forgedNack);
+  const forgedSigned = signControlFrame(forgedBuf, pairwiseKey((clientB as any).clientECDH, aPub));
+  sendUdp(forgedSigned);
+  await delay(200);
+  const forgedRetrans = (clientA as any).stats.retransmits;
+  console.log(`  A retransmits after FORGED NACK (expect 0): ${forgedRetrans} ${forgedRetrans === 0 ? 'OK' : 'FAIL'}`);
+
+  // Positive control: B sends a genuine NACK (senderId=B) -> A must retransmit.
+  const realNack = { type: TYPE_NACK, convId: 1, senderId: clientB.senderId, targetId: clientA.senderId, missingSeq: [1] };
+  const realBuf = Codec.encodeNack(realNack);
+  const realSigned = signControlFrame(realBuf, pairwiseKey((clientB as any).clientECDH, aPub));
+  sendUdp(realSigned);
+  await delay(200);
+  const realRetrans = (clientA as any).stats.retransmits;
+  console.log(`  A retransmits after GENUINE NACK (expect >= 1): ${realRetrans} ${realRetrans >= 1 ? 'OK' : 'FAIL'}`);
+
+  // B forges a DictReset claiming to be C, targeting A (server-verified path).
+  // The server must reject it, so A's history survives.
+  const forgedReset = { type: 0x06, convId: 1, senderId: clientC.senderId, targetId: clientA.senderId };
+  const forgedResetBuf = Codec.encodeDictReset(forgedReset);
+  const sPub = (clientB as any).serverPubKeys.get(1);
+  const forgedResetSigned = signControlFrame(forgedResetBuf, pairwiseKey((clientB as any).clientECDH, sPub));
+  (clientB as any).broadcast(forgedResetSigned);
+  await delay(200);
+  const historyIntact = (clientA as any).sentMessages.has(1);
+  console.log(`  A history intact after FORGED DictReset (expect true): ${historyIntact} ${historyIntact ? 'OK' : 'FAIL'}`);
+
+  // --- Test 7: Per-message ratchet properties ---
+  console.log("--- Test 7: Per-message ratchet (unique keys, forward secrecy) ---");
+  const seed = Buffer.alloc(32, 0x42);
+  const m0 = advanceChain({ key: seed, index: 0 }, 0);
+  const m1 = advanceChain(m0.state, 1);
+  const m2 = advanceChain(m1.state, 2);
+  const keysDistinct = !m0.messageKey.equals(m1.messageKey) && !m1.messageKey.equals(m2.messageKey) && !m0.messageKey.equals(m2.messageKey);
+  // The chain is one-way: after ratcheting to index 2 the chain key is not the
+  // seed, so a compromised chain state can't recover past message keys.
+  const ratcheted = !m2.state.key.equals(seed);
+  // A receiver that skipped a gap derives the SAME key as one that processed
+  // every message (loss tolerance).
+  const skipped = advanceChain({ key: m0.state.key, index: 1 }, 3);
+  const sequential = advanceChain(m1.state, 3);
+  const gapConsistent = skipped.messageKey.equals(sequential.messageKey);
+  const labeled = chainMessageKey(chainNextKey(seed), 1).equals(m1.messageKey);
+  // Golden cross-language vectors (must match the Go / Rust codec tests).
+  const gSeed = Buffer.alloc(32, 0x44);
+  const gMatch =
+    chainMessageKey(gSeed, 0).equals(Buffer.from('e4b4d1bdd01191ce786b8f5efe2202757d94378135ad772bb9e01ed22d8ce688', 'hex')) &&
+    chainNextKey(gSeed).equals(Buffer.from('4f174eacd84d526c6e0ebd801d14be1a17b4b87d740f1d9518349204546d5e38', 'hex')) &&
+    advanceChain({ key: gSeed, index: 0 }, 2).messageKey.equals(Buffer.from('1ded480040e14f6fba5be12a1666a3542dec36f01629c21411b9d5f80bce05a0', 'hex'));
+  console.log(`  keys distinct: ${keysDistinct} ${keysDistinct ? 'OK' : 'FAIL'}`);
+  console.log(`  chain ratcheted (one-way): ${ratcheted} ${ratcheted ? 'OK' : 'FAIL'}`);
+  console.log(`  gap-consistent (loss tolerance): ${gapConsistent} ${gapConsistent ? 'OK' : 'FAIL'}`);
+  console.log(`  index-labeled keys: ${labeled} ${labeled ? 'OK' : 'FAIL'}`);
+  console.log(`  golden vectors match (Go/Rust): ${gMatch} ${gMatch ? 'OK' : 'FAIL'}`);
+
+  // --- Test 6: Creator departure -> successor election + immediate rekey ---
+  console.log("--- Test 6: Creator departure (successor takes over rotation) ---");
+  const epochBefore = currentEpochs.get(1) || 1;
+  // Simulate the creator (A=8001) leaving: the server elects the smallest
+  // remaining senderId (B=8002) as the new creator and notifies everyone.
+  (server as any).removePeer('udp:127.0.0.1:8001');
+  await delay(500);
+  const bIsCreator = (clientB as any).isCreator.get(1) === true;
+  const cIsCreator = (clientC as any).isCreator.get(1) === true;
+  const epochAfter = currentEpochs.get(1) || 1;
+  const successorElected = bIsCreator && !cIsCreator;
+  const rekeyed = epochAfter > epochBefore;
+  console.log(`  B isCreator=${bIsCreator} C isCreator=${cIsCreator} (expect true/false) ${successorElected ? 'OK' : 'FAIL'}`);
+  console.log(`  epoch ${epochBefore} -> ${epochAfter} (expect bumped) ${rekeyed ? 'OK' : 'FAIL'}`);
+
   clientA.close();
   clientB.close();
   clientC.close();
   clientD.close();
+  clientE.close();
+  clientF.close();
   server.close();
   console.log("Tests Complete.");
 }

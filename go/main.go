@@ -20,6 +20,12 @@ import (
 	"time"
 )
 
+// Cached per-message key + chain index for a sent message (retransmission).
+type messageKeyEntry struct {
+	key []byte
+	idx uint32
+}
+
 type NativeDartClient struct {
 	conn       *net.UDPConn
 	senderId   uint16
@@ -29,6 +35,15 @@ type NativeDartClient struct {
 	serverAddr *net.UDPAddr
 
 	serverFingerprint string
+
+	// Server public key per conversation (from MEMBER_INFO), used to key the
+	// server-verified SYNC / Dict-Reset frames.
+	serverPubKeys map[uint16][]byte
+
+	// Per-sender ratchet chains: convId -> epoch -> senderId -> chain state.
+	senderChains    map[uint16]map[uint16]map[uint16]core.ChainState
+	chainSharedWith map[uint16]map[uint16]bool
+	messageKeys     map[uint32]messageKeyEntry
 
 	tcpConn     net.Conn
 	useFallback bool
@@ -93,6 +108,10 @@ func NewNativeDartClient(serverIP string, port int) (*NativeDartClient, error) {
 		roster:           make(map[uint16]map[uint16][]byte),
 		sharedWith:       make(map[uint16]map[uint16]bool),
 		isCreator:        make(map[uint16]bool),
+		serverPubKeys:    make(map[uint16][]byte),
+		senderChains:    make(map[uint16]map[uint16]map[uint16]core.ChainState),
+		chainSharedWith: make(map[uint16]map[uint16]bool),
+		messageKeys:     make(map[uint32]messageKeyEntry),
 	}, nil
 }
 
@@ -146,31 +165,32 @@ func (c *NativeDartClient) enableFallback(host string, port int) error {
 func (c *NativeDartClient) getDictionary(senderId uint16, maxSeq uint32) []byte {
 	// Delta-compress against a bounded window of the SAME sender's history so
 	// both sides always build identical dictionaries (and older history can
-	// be pruned).
+	// be pruned). The window is selected in the modular 24-bit space so it
+	// stays correct across a sequence-number wrap.
 	var msgsToConcat []*core.DataDart
-	minSeq := uint32(1)
-	if maxSeq > core.DictWindow {
-		minSeq = maxSeq - core.DictWindow
-	}
 
 	if senderId == c.senderId {
 		for seq, dart := range c.sentMessages {
-			if seq >= minSeq && seq < maxSeq {
+			dist := core.SeqDelta(seq, maxSeq)
+			if dist >= 1 && dist <= core.DictWindow {
 				msgsToConcat = append(msgsToConcat, dart)
 			}
 		}
 	} else {
 		if msgs, ok := c.receivedMessages[senderId]; ok {
 			for seq, dart := range msgs {
-				if seq >= minSeq && seq < maxSeq {
+				dist := core.SeqDelta(seq, maxSeq)
+				if dist >= 1 && dist <= core.DictWindow {
 					msgsToConcat = append(msgsToConcat, dart)
 				}
 			}
 		}
 	}
 
+	// Oldest-first (largest distance behind maxSeq) so all implementations
+	// build byte-identical dictionaries across a wrap.
 	sort.Slice(msgsToConcat, func(i, j int) bool {
-		return msgsToConcat[i].Seq < msgsToConcat[j].Seq
+		return core.SeqDelta(msgsToConcat[i].Seq, maxSeq) > core.SeqDelta(msgsToConcat[j].Seq, maxSeq)
 	})
 
 	var buf bytes.Buffer
@@ -183,33 +203,26 @@ func (c *NativeDartClient) getDictionary(senderId uint16, maxSeq uint32) []byte 
 // pruneSent bounds memory by dropping sent history older than the dictionary
 // window (+ slack), so the compression dictionary stays small.
 func (c *NativeDartClient) pruneSent() {
-	minSeq := uint32(1)
-	if c.highestSentSeq > core.DictWindow+16 {
-		minSeq = c.highestSentSeq - core.DictWindow - 16
-	}
 	for seq := range c.sentMessages {
-		if seq < minSeq {
+		if core.SeqDelta(seq, c.highestSentSeq) > core.DictWindow+16 {
 			delete(c.sentMessages, seq)
+			delete(c.messageKeys, seq)
 		}
 	}
 }
 
 func (c *NativeDartClient) pruneReceived(senderId uint16) {
 	highest := c.highestReceived[senderId]
-	minSeq := uint32(1)
-	if highest > core.DictWindow+16 {
-		minSeq = highest - core.DictWindow - 16
-	}
 	if msgs, ok := c.receivedMessages[senderId]; ok {
 		for seq := range msgs {
-			if seq < minSeq {
+			if core.SeqDelta(seq, highest) > core.DictWindow+16 {
 				delete(msgs, seq)
 			}
 		}
 	}
 	if ts, ok := c.nackTimestamps[senderId]; ok {
 		for seq := range ts {
-			if seq < minSeq {
+			if core.SeqDelta(seq, highest) > core.DictWindow+16 {
 				delete(ts, seq)
 			}
 		}
@@ -239,8 +252,21 @@ func (c *NativeDartClient) SendData(roomId uint16, payload string) {
 		return
 	}
 
+	epoch := c.codec.CurrentEpochs[roomId]
+	if epoch == 0 {
+		epoch = 1
+	}
+	myChain, ok := c.getChain(roomId, epoch, c.senderId)
+	if !ok {
+		c.pendingQueue = append(c.pendingQueue, payload)
+		return
+	}
+	idx := myChain.Index
+	messageKey, state := core.AdvanceChain(myChain, idx)
+	c.setChain(roomId, epoch, c.senderId, state)
+
 	seq := c.nextSeq
-	c.nextSeq++
+	c.nextSeq = core.SeqNext(c.nextSeq)
 	
 	dart := &core.DataDart{
 		Type:     core.TypeData,
@@ -250,11 +276,12 @@ func (c *NativeDartClient) SendData(roomId uint16, payload string) {
 		Payload:  payload,
 	}
 	c.sentMessages[seq] = dart
+	c.messageKeys[seq] = messageKeyEntry{key: messageKey, idx: idx}
 	c.highestSentSeq = seq
 	c.pruneSent()
 
 	dict := c.getDictionary(c.senderId, seq)
-	buf, err := c.codec.EncodeData(dart, dict)
+	buf, err := c.codec.EncodeData(dart, dict, messageKey, idx, nil)
 	if err == nil {
 		c.send(buf)
 	}
@@ -279,19 +306,32 @@ func (c *NativeDartClient) sendSync(convId uint16) {
 		SenderId:   c.senderId,
 		HighestSeq: c.highestSentSeq,
 	}
-	buf, _ := c.codec.EncodeSync(sync)
-	c.send(buf)
+	buf, _ := c.codec.EncodeSync(sync, nil)
+	serverPub := c.serverPubKeys[convId]
+	if serverPub == nil {
+		return
+	}
+	if key, err := core.PairwiseKey(c.ecdh, serverPub); err == nil {
+		c.send(core.SignControlFrame(buf, key))
+	}
 }
 
-func (c *NativeDartClient) sendNack(convId uint16, senderId uint16, missing []uint32) {
+func (c *NativeDartClient) sendNack(convId uint16, targetId uint16, missing []uint32) {
 	nack := &core.NackDart{
 		Type:       core.TypeNack,
 		ConvId:     convId,
-		SenderId:   senderId,
+		SenderId:   c.senderId,
+		TargetId:   targetId,
 		MissingSeq: missing,
 	}
-	buf, _ := c.codec.EncodeNack(nack)
-	c.send(buf)
+	buf, _ := c.codec.EncodeNack(nack, nil)
+	peerPub := c.roster[convId][targetId]
+	if peerPub == nil {
+		return
+	}
+	if key, err := core.PairwiseKey(c.ecdh, peerPub); err == nil {
+		c.send(core.SignControlFrame(buf, key))
+	}
 }
 
 func (c *NativeDartClient) sendAck(convId uint16, targetId uint16, seq uint32) {
@@ -302,8 +342,14 @@ func (c *NativeDartClient) sendAck(convId uint16, targetId uint16, seq uint32) {
 		TargetId: targetId,
 		Seq:      seq,
 	}
-	buf, _ := c.codec.EncodeAck(ack)
-	c.send(buf)
+	buf, _ := c.codec.EncodeAck(ack, nil)
+	peerPub := c.roster[convId][targetId]
+	if peerPub == nil {
+		return
+	}
+	if key, err := core.PairwiseKey(c.ecdh, peerPub); err == nil {
+		c.send(core.SignControlFrame(buf, key))
+	}
 }
 
 func (c *NativeDartClient) sendDictReset(convId uint16, targetId uint16) {
@@ -313,8 +359,14 @@ func (c *NativeDartClient) sendDictReset(convId uint16, targetId uint16) {
 		SenderId: c.senderId,
 		TargetId: targetId,
 	}
-	buf, _ := c.codec.EncodeDictReset(reset)
-	c.send(buf)
+	buf, _ := c.codec.EncodeDictReset(reset, nil)
+	serverPub := c.serverPubKeys[convId]
+	if serverPub == nil {
+		return
+	}
+	if key, err := core.PairwiseKey(c.ecdh, serverPub); err == nil {
+		c.send(core.SignControlFrame(buf, key))
+	}
 }
 
 func (c *NativeDartClient) JoinRoom(roomId uint16) {
@@ -353,6 +405,8 @@ func (c *NativeDartClient) adoptKey(convId uint16, epoch uint16, key []byte) {
 			delete(c.sharedWith[convId], k)
 		}
 	}
+	// Start a fresh per-sender ratchet chain for this epoch and share it.
+	c.initOwnChain(convId, epoch)
 	if !hadKey {
 		fmt.Printf("\x1b[36m[SYSTEM] Room %d group key established (epoch %d). Type /quit to exit.\x1b[0m\n", convId, epoch)
 		c.mu.Unlock()
@@ -383,33 +437,170 @@ func (c *NativeDartClient) shareWithNewMembers(convId uint16) {
 	if done == nil {
 		done = make(map[uint16]bool)
 	}
-	for mId, mPub := range roster {
+	var targets []uint16
+	for mId := range roster {
 		if mId == c.senderId || done[mId] {
 			continue
 		}
-		sharedSecret, err := c.ecdh.ComputeSecret(mPub)
-		if err != nil {
-			continue
-		}
-		hasher := sha256.New()
-		hasher.Write(sharedSecret)
-		transportKey := hasher.Sum(nil)
-		share := &core.KeyShareDart{
-			Type:         core.TypeKeyShare,
-			ConvId:       convId,
-			SenderId:     c.senderId,
-			TargetId:     mId,
-			Epoch:        epoch,
-			Nonce:        make([]byte, 12),
-			EncryptedKey: key,
-		}
-		cryptorand.Read(share.Nonce)
-		if out, err := c.codec.EncodeKeyShare(share, transportKey); err == nil {
-			c.send(out)
-		}
+		targets = append(targets, mId)
 		done[mId] = true
 	}
 	c.sharedWith[convId] = done
+	if len(targets) == 0 {
+		return
+	}
+	doShare := func() {
+		for _, mId := range targets {
+			mPub := roster[mId]
+			sharedSecret, err := c.ecdh.ComputeSecret(mPub)
+			if err != nil {
+				continue
+			}
+			hasher := sha256.New()
+			hasher.Write(sharedSecret)
+			transportKey := hasher.Sum(nil)
+			share := &core.KeyShareDart{
+				Type:         core.TypeKeyShare,
+				ConvId:       convId,
+				SenderId:     c.senderId,
+				TargetId:     mId,
+				Epoch:        epoch,
+				Nonce:        make([]byte, 12),
+				EncryptedKey: key,
+			}
+			cryptorand.Read(share.Nonce)
+			if out, err := c.codec.EncodeKeyShare(share, transportKey); err == nil {
+				c.send(out)
+			}
+		}
+	}
+	doShare()
+	// Retry a couple of times: the group-key share goes over UDP and can be
+	// lost; a member that misses it can't adopt the key or join the room.
+	retry := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		doShare()
+	}
+	time.AfterFunc(300*time.Millisecond, retry)
+	time.AfterFunc(1000*time.Millisecond, retry)
+}
+
+// ---- Per-sender ratchet chain management ----
+
+func (c *NativeDartClient) getChain(convId uint16, epoch uint16, senderId uint16) (core.ChainState, bool) {
+	cs, ok := c.senderChains[convId][epoch][senderId]
+	return cs, ok
+}
+
+func (c *NativeDartClient) setChain(convId uint16, epoch uint16, senderId uint16, state core.ChainState) {
+	if c.senderChains[convId] == nil {
+		c.senderChains[convId] = make(map[uint16]map[uint16]core.ChainState)
+	}
+	if c.senderChains[convId][epoch] == nil {
+		c.senderChains[convId][epoch] = make(map[uint16]core.ChainState)
+	}
+	c.senderChains[convId][epoch][senderId] = state
+}
+
+// initOwnChain generates a fresh chain seed for my own sends in `epoch` and
+// shares it with every member (so they can decrypt my future messages).
+func (c *NativeDartClient) initOwnChain(convId uint16, epoch uint16) {
+	seed := make([]byte, 32)
+	cryptorand.Read(seed)
+	c.setChain(convId, epoch, c.senderId, core.ChainState{Key: seed, Index: 0})
+	c.chainSharedWith[convId] = make(map[uint16]bool)
+	c.shareChainWithMembers(convId, epoch)
+}
+
+func (c *NativeDartClient) shareChainWithMembers(convId uint16, epoch uint16) {
+	myChain, ok := c.getChain(convId, epoch, c.senderId)
+	if !ok {
+		return
+	}
+	if c.chainSharedWith[convId] == nil {
+		c.chainSharedWith[convId] = make(map[uint16]bool)
+	}
+	var targets []uint16
+	for mId := range c.roster[convId] {
+		if mId == c.senderId || c.chainSharedWith[convId][mId] {
+			continue
+		}
+		targets = append(targets, mId)
+		c.chainSharedWith[convId][mId] = true
+	}
+	if len(targets) == 0 {
+		return
+	}
+	shareLocked := func() {
+		for _, mId := range targets {
+			c.sendChainShare(convId, epoch, mId, myChain.Key, myChain.Index)
+		}
+	}
+	shareLocked()
+	// Retry a couple of times: the shares go over UDP and a receiver that
+	// misses its only copy can never decrypt this sender's messages. A stale
+	// share is safe (the chain is deterministic).
+	retry := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		shareLocked()
+	}
+	time.AfterFunc(300*time.Millisecond, retry)
+	time.AfterFunc(1000*time.Millisecond, retry)
+}
+
+func (c *NativeDartClient) sendChainShare(convId uint16, epoch uint16, targetId uint16, chainKey []byte, chainIndex uint32) {
+	mPub := c.roster[convId][targetId]
+	if mPub == nil {
+		return
+	}
+	sharedSecret, err := c.ecdh.ComputeSecret(mPub)
+	if err != nil {
+		return
+	}
+	hasher := sha256.New()
+	hasher.Write(sharedSecret)
+	transportKey := hasher.Sum(nil)
+	share := &core.ChainShareDart{
+		Type:       core.TypeChainShare,
+		ConvId:     convId,
+		SenderId:   c.senderId,
+		TargetId:   targetId,
+		Epoch:      epoch,
+		Nonce:      make([]byte, 12),
+		ChainKey:   chainKey,
+		ChainIndex: chainIndex,
+	}
+	cryptorand.Read(share.Nonce)
+	if out, err := c.codec.EncodeChainShare(share, transportKey); err == nil {
+		c.send(out)
+	}
+}
+
+func (c *NativeDartClient) handleChainShare(buf []byte) {
+	convId := binary.BigEndian.Uint16(buf[1:3])
+	senderId := binary.BigEndian.Uint16(buf[3:5])
+	targetId := binary.BigEndian.Uint16(buf[5:7])
+	if targetId != c.senderId {
+		return
+	}
+	sharerPub := c.roster[convId][senderId]
+	if sharerPub == nil {
+		return
+	}
+	sharedSecret, err := c.ecdh.ComputeSecret(sharerPub)
+	if err != nil {
+		return
+	}
+	hasher := sha256.New()
+	hasher.Write(sharedSecret)
+	transportKey := hasher.Sum(nil)
+	decoded, err := c.codec.DecodeChainShare(buf, transportKey)
+	if err != nil {
+		return
+	}
+	c.setChain(convId, decoded.Epoch, decoded.SenderId, core.ChainState{Key: decoded.ChainKey, Index: decoded.ChainIndex})
 }
 
 // Forward secrecy: rotate the group key. Old epochs stay decryptable via
@@ -417,6 +608,11 @@ func (c *NativeDartClient) shareWithNewMembers(convId uint16) {
 func (c *NativeDartClient) rekey(convId uint16) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.doRekey(convId)
+}
+
+// doRekey performs the rotation; the caller must hold c.mu.
+func (c *NativeDartClient) doRekey(convId uint16) {
 	if !c.isCreator[convId] {
 		return
 	}
@@ -478,7 +674,7 @@ func (c *NativeDartClient) declarePermanentLoss(convId uint16, senderId uint16, 
 		Payload:  "",
 	}
 	
-	if lostSeq > c.highestReceived[senderId] {
+	if d := core.SeqDelta(c.highestReceived[senderId], lostSeq); d > 0 && d < core.SeqMod/2 {
 		c.highestReceived[senderId] = lostSeq
 	}
 	
@@ -489,7 +685,7 @@ func (c *NativeDartClient) declarePermanentLoss(convId uint16, senderId uint16, 
 }
 
 func (c *NativeDartClient) processBufferedPackets(senderId uint16) {
-	nextSeq := c.highestReceived[senderId] + 1
+	nextSeq := core.SeqNext(c.highestReceived[senderId])
 	bufferMap, ok := c.outOfOrderBuffer[senderId]
 	if !ok {
 		return
@@ -501,14 +697,36 @@ func (c *NativeDartClient) processBufferedPackets(senderId uint16) {
 			break
 		}
 		delete(bufferMap, nextSeq)
-		c.processDataPacket(buf, senderId, nextSeq)
-		nextSeq++
+		dec := c.decryptDataInOrder(buf, senderId)
+		if dec != nil && dec.SenderId == senderId {
+			c.processDataPacket(buf, dec, senderId, nextSeq)
+		}
+		nextSeq = core.SeqNext(nextSeq)
 	}
 }
 
-func (c *NativeDartClient) processDataPacket(buf []byte, parsedSenderId uint16, seq uint32) {
-	dec, err := c.codec.DecryptData(buf)
-	if err != nil || dec.SenderId != parsedSenderId {
+// decryptDataInOrder decrypts a data packet with the sender's ratchet chain,
+// advancing the chain to the packet's index. Only commits after a successful
+// decrypt, so a failed attempt doesn't burn chain keys.
+func (c *NativeDartClient) decryptDataInOrder(buf []byte, senderId uint16) *core.DecryptedData {
+	epoch := binary.BigEndian.Uint16(buf[21:23])
+	idx := binary.BigEndian.Uint32(buf[27:31])
+	convId := binary.BigEndian.Uint16(buf[1:3])
+	chain, ok := c.getChain(convId, epoch, senderId)
+	if !ok || idx < chain.Index {
+		return nil
+	}
+	messageKey, state := core.AdvanceChain(chain, idx)
+	dec, err := c.codec.DecryptData(buf, messageKey)
+	if err != nil {
+		return nil
+	}
+	c.setChain(convId, epoch, senderId, state)
+	return dec
+}
+
+func (c *NativeDartClient) processDataPacket(buf []byte, dec *core.DecryptedData, parsedSenderId uint16, seq uint32) {
+	if dec.SenderId != parsedSenderId {
 		return
 	}
 	dict := c.getDictionary(parsedSenderId, seq)
@@ -540,7 +758,11 @@ func (c *NativeDartClient) processDataPacket(buf []byte, parsedSenderId uint16, 
 	
 	if _, has := c.receivedMessages[dart.SenderId][dart.Seq]; !has {
 		c.receivedMessages[dart.SenderId][dart.Seq] = dart
-		if dart.Seq > highestReceived {
+		d := uint32(1)
+		if _, ok := c.highestReceived[dart.SenderId]; ok {
+			d = core.SeqDelta(highestReceived, dart.Seq)
+		}
+		if d > 0 && d < core.SeqMod/2 {
 			c.highestReceived[dart.SenderId] = dart.Seq
 		}
 		c.pruneReceived(dart.SenderId)
@@ -581,28 +803,41 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 
 	switch typ {
 	case core.TypeData:
-		dec, err := c.codec.DecryptData(buf)
-		if err != nil {
-			fmt.Printf("\x1b[31m[SYSTEM] Packet dropped (decrypt failure or tamper detected): %v\x1b[0m\n", err)
+		if len(buf) < 7+24 {
 			return
 		}
-		parsedSenderId := dec.SenderId
-		seq := dec.Seq
-		convId := dec.ConvId
+		if int(buf[6]) < 24 {
+			return
+		}
+		convId := binary.BigEndian.Uint16(buf[1:3])
+		seq := uint32(buf[3])<<16 | uint32(buf[4])<<8 | uint32(buf[5])
+		parsedSenderId := binary.BigEndian.Uint16(buf[7:9])
 
+		_, hasBaseline := c.highestReceived[parsedSenderId]
 		highestReceived := c.highestReceived[parsedSenderId]
-		if seq <= highestReceived {
+		// Modular gap test: 0 = duplicate, >= SeqMod/2 = stale, 1 = exact next.
+		// A receiver with no baseline yet treats the first packet as its
+		// baseline, except when the first seq is within the recoverable window:
+		// then NACK the real gap instead of accepting an out-of-order start.
+		ahead := uint32(1)
+		if hasBaseline {
+			ahead = core.SeqDelta(highestReceived, seq)
+		} else if seq >= 1 && seq <= core.DictWindow {
+			ahead = seq
+		}
+		if ahead == 0 || ahead >= core.SeqMod/2 {
 			return
 		}
 
-		if seq > highestReceived+1 {
+		if ahead > 1 {
 			if c.outOfOrderBuffer[parsedSenderId] == nil {
 				c.outOfOrderBuffer[parsedSenderId] = make(map[uint32][]byte)
 			}
 			c.outOfOrderBuffer[parsedSenderId][seq] = buf
 
 			var missing []uint32
-			for i := highestReceived + 1; i < seq; i++ {
+			for k := uint32(1); k < ahead; k++ {
+				i := (highestReceived + k) & 0xFFFFFF
 				_, inBuffer := c.outOfOrderBuffer[parsedSenderId][i]
 				msgs, hasSender := c.receivedMessages[parsedSenderId]
 				inReceived := false
@@ -635,35 +870,76 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			return
 		}
 
-		c.processDataPacket(buf, parsedSenderId, seq)
-		c.processBufferedPackets(parsedSenderId)
+		dec := c.decryptDataInOrder(buf, parsedSenderId)
+		if dec != nil {
+			c.processDataPacket(buf, dec, parsedSenderId, seq)
+			c.processBufferedPackets(parsedSenderId)
+		}
+
+	case core.TypeChainShare:
+		c.handleChainShare(buf)
 
 	case core.TypeNack:
-		nack, err := c.codec.DecodeNack(buf)
-		if err != nil || nack.SenderId != c.senderId {
+		nackConvId := binary.BigEndian.Uint16(buf[1:3])
+		nackSenderId := binary.BigEndian.Uint16(buf[3:5])
+		nackTargetId := binary.BigEndian.Uint16(buf[5:7])
+		if nackTargetId != c.senderId {
+			return
+		}
+		// Verify the sender's per-sender MAC so a group member can't forge
+		// another member's NACK.
+		peerPub := c.roster[nackConvId][nackSenderId]
+		if peerPub == nil {
+			return
+		}
+		key, err := core.PairwiseKey(c.ecdh, peerPub)
+		if err != nil {
+			return
+		}
+		stripped, ok := core.VerifyControlFrame(buf, key)
+		if !ok {
+			return
+		}
+		nack, err := c.codec.DecodeNack(stripped)
+		if err != nil {
 			return
 		}
 		fmt.Printf("\x1b[33m[SYSTEM] Receiver missed seqs %v. Sending NACK repairs...\x1b[0m\n", nack.MissingSeq)
 		for _, seq := range nack.MissingSeq {
 			if dart, ok := c.sentMessages[seq]; ok {
-				dict := c.getDictionary(c.senderId, seq)
-				outBuf, _ := c.codec.EncodeData(dart, dict)
-				c.send(outBuf)
+				if mk, ok := c.messageKeys[seq]; ok {
+					dict := c.getDictionary(c.senderId, seq)
+					outBuf, _ := c.codec.EncodeData(dart, dict, mk.key, mk.idx, nil)
+					c.send(outBuf)
+				}
 			}
 		}
 
 	case core.TypeSync:
-		sync, err := c.codec.DecodeSync(buf)
+		// SYNC is keyed to the relay server, which verified and relayed it.
+		syncStripped, ok := core.StripControlFrame(buf)
+		if !ok {
+			return
+		}
+		sync, err := c.codec.DecodeSync(syncStripped)
 		if err != nil {
 			return
 		}
+		_, hasBaseline := c.highestReceived[sync.SenderId]
 		highestReceived := c.highestReceived[sync.SenderId]
-		if sync.HighestSeq > highestReceived {
+		// Fresh receiver: NACK the whole reported range; otherwise only the
+		// modular distance ahead of what we've seen (handles wraps).
+		ahead := sync.HighestSeq
+		if hasBaseline {
+			ahead = core.SeqDelta(highestReceived, sync.HighestSeq)
+		}
+		if ahead > 0 && ahead < core.SeqMod/2 {
 			var missing []uint32
 			if c.receivedMessages[sync.SenderId] == nil {
 				c.receivedMessages[sync.SenderId] = make(map[uint32]*core.DataDart)
 			}
-			for i := highestReceived + 1; i <= sync.HighestSeq; i++ {
+			for k := uint32(1); k <= ahead; k++ {
+				i := (highestReceived + k) & 0xFFFFFF
 				_, inBuffer := c.outOfOrderBuffer[sync.SenderId][i]
 				_, inReceived := c.receivedMessages[sync.SenderId][i]
 				if !inBuffer && !inReceived {
@@ -688,14 +964,30 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			if len(missing) > 0 {
 				fmt.Printf("\x1b[33m[SYSTEM] Sync probe revealed gap. Sent NACK for seqs: %v\x1b[0m\n", missing)
 				c.sendNack(sync.ConvId, sync.SenderId, missing)
-			} else if highestReceived == sync.HighestSeq {
-				c.sendAck(sync.ConvId, sync.SenderId, highestReceived)
 			}
 		}
 
 	case core.TypeAck:
-		ack, err := c.codec.DecodeAck(buf)
-		if err == nil && ack.TargetId == c.senderId && ack.Seq >= c.highestSentSeq {
+		ackConvId := binary.BigEndian.Uint16(buf[1:3])
+		ackSenderId := binary.BigEndian.Uint16(buf[3:5])
+		ackTargetId := binary.BigEndian.Uint16(buf[5:7])
+		if ackTargetId != c.senderId {
+			return
+		}
+		peerPub := c.roster[ackConvId][ackSenderId]
+		if peerPub == nil {
+			return
+		}
+		key, err := core.PairwiseKey(c.ecdh, peerPub)
+		if err != nil {
+			return
+		}
+		ackStripped, ok := core.VerifyControlFrame(buf, key)
+		if !ok {
+			return
+		}
+		ack, err := c.codec.DecodeAck(ackStripped)
+		if err == nil && core.SeqDelta(c.highestSentSeq, ack.Seq) < core.SeqMod/2 {
 			c.clearSyncTimers()
 			fmt.Printf("\x1b[90m[✓] Delivered (Seq %d)                                  \x1b[0m\n", ack.Seq)
 		}
@@ -759,6 +1051,8 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			roster[m.SenderId] = m.PubKey
 		}
 		c.roster[info.ConvId] = roster
+		c.serverPubKeys[info.ConvId] = serverPub
+		prevCreator := c.isCreator[info.ConvId]
 		c.isCreator[info.ConvId] = info.Creator
 		if _, has := c.codec.ConvKeys[info.ConvId]; has {
 			c.shareWithNewMembers(info.ConvId)
@@ -767,10 +1061,28 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			cryptorand.Read(key)
 			c.adoptKey(info.ConvId, 1, key)
 		}
+		// If I just became the creator (successor election after the previous
+		// creator left), rotate immediately so the departed member loses access.
+		if info.Creator && !prevCreator {
+			if _, has := c.codec.ConvKeys[info.ConvId]; has {
+				c.doRekey(info.ConvId)
+			}
+		}
+		// Share my ratchet chain with any members that just joined.
+		epoch := c.codec.CurrentEpochs[info.ConvId]
+		if epoch == 0 {
+			epoch = 1
+		}
+		c.shareChainWithMembers(info.ConvId, epoch)
 		c.scheduleRekey(info.ConvId)
 
 	case core.TypeDictReset:
-		reset, err := c.codec.DecodeDictReset(buf)
+		// Dict-Reset is keyed to the relay server, which verified it.
+		resetStripped, ok := core.StripControlFrame(buf)
+		if !ok {
+			return
+		}
+		reset, err := c.codec.DecodeDictReset(resetStripped)
 		if err == nil {
 			if reset.TargetId == c.senderId {
 				fmt.Printf("\x1b[31m[SYSTEM] User %d requested a dictionary reset. Flushing history...\x1b[0m\n", reset.SenderId)

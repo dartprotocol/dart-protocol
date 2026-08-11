@@ -573,7 +573,7 @@ tr:last-child td {
 
 .bench-summary {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
     gap: 2rem;
 }
 
@@ -669,6 +669,188 @@ footer {
     margin: 3rem 0;
 }
 
+.chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1.5rem;
+    margin: 2rem 0 3rem;
+}
+
+.chart-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-lg);
+    padding: 1.75rem;
+}
+
+/* Tabbed benchmark chart (one wide card, three tabs) */
+.chart-tabs {
+    padding: 1.5rem 2rem 2.25rem;
+    margin: 2rem 0 3rem;
+}
+
+.chart-tab-input {
+    display: none;
+}
+
+.tabs-head {
+    display: flex;
+    gap: 0.35rem;
+    border-bottom: 1px solid var(--border-light);
+    margin-bottom: 1.75rem;
+    padding: 0 0.25rem;
+}
+
+.tabs-head label {
+    flex: 1 1 0;
+    text-align: center;
+    padding: 0.7rem 0.5rem;
+    cursor: pointer;
+    font-size: 0.92rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    border-radius: 8px 8px 0 0;
+    transition: color 0.2s ease, background 0.2s ease;
+    white-space: nowrap;
+}
+
+@media (max-width: 600px) {
+    .tabs-head {
+        flex-wrap: wrap;
+    }
+
+    .tabs-head label {
+        flex: 1 1 100%;
+        white-space: normal;
+        padding: 0.7rem 1rem;
+    }
+}
+
+.tabs-head label:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+}
+
+#chart-tab-1:checked ~ .tabs-head label[for="chart-tab-1"],
+#chart-tab-2:checked ~ .tabs-head label[for="chart-tab-2"],
+#chart-tab-3:checked ~ .tabs-head label[for="chart-tab-3"] {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent);
+}
+
+.tab-panel {
+    display: none;
+}
+
+#chart-tab-1:checked ~ .tabs-body .panel-1,
+#chart-tab-2:checked ~ .tabs-body .panel-2,
+#chart-tab-3:checked ~ .tabs-body .panel-3 {
+    display: block;
+}
+
+.tab-panel .chart-inner {
+    max-width: 860px;
+    margin: 0 auto;
+}
+
+.tab-panel svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.chart-card .chart-title {
+    text-align: center;
+    margin-bottom: 1.25rem;
+    color: var(--text-primary);
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+
+.chart-card svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.chart-svg text {
+    fill: var(--text-muted);
+    font-size: 11px;
+    font-family: 'Fira Code', monospace;
+}
+
+.chart-svg .grid {
+    stroke: var(--border-light);
+    stroke-dasharray: 3 3;
+}
+
+.chart-svg .axis-label {
+    fill: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.chart-svg .bar-dart {
+    fill: var(--accent);
+}
+
+.chart-svg .bar-baseline {
+    fill: #4b5563;
+}
+
+.chart-svg .bar-dart:hover {
+    fill: var(--accent-hover);
+}
+
+.chart-svg .ceiling {
+    stroke: var(--warning);
+    stroke-dasharray: 5 4;
+    stroke-width: 1.5;
+}
+
+.chart-svg .area {
+    fill: rgba(94, 106, 210, 0.16);
+}
+
+.chart-svg .line {
+    stroke: var(--accent);
+    stroke-width: 2.5;
+    fill: none;
+}
+
+.chart-svg .point {
+    fill: var(--accent);
+    stroke: var(--bg-card);
+    stroke-width: 2;
+}
+
+.chart-svg .value {
+    fill: var(--text-primary);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.chart-svg .tick {
+    fill: var(--text-muted);
+    font-size: 10px;
+}
+
+.method-note {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    max-width: 760px;
+    margin: -1.25rem auto 2.5rem;
+    line-height: 1.6;
+}
+
+.method-note code {
+    font-family: 'Fira Code', monospace;
+    color: var(--accent);
+}
+
 .chart-title {
     text-align: center;
     margin-bottom: 2rem;
@@ -745,6 +927,9 @@ section[id] {
 }
 
 @media (max-width: 900px) {
+    html, body {
+        overflow-x: hidden; /* the off-screen nav drawer must not create a horizontal scrollbar */
+    }
     .nav-toggle-btn {
         display: flex;
         flex-direction: column;
@@ -898,4 +1083,177 @@ section[id] {
     .article li {
         font-size: 1rem;
     }
+}
+
+/* ============================================================================
+   Shared page styles (used by use-cases.html, why-dart.html, and friends)
+   ========================================================================== */
+
+.page-hero {
+    padding: 10rem 0 4rem;
+    text-align: center;
+}
+
+.lead {
+    max-width: 720px;
+    margin: 1.5rem auto 0;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    line-height: 1.7;
+}
+
+.use-case-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1.5rem;
+    margin-top: 3rem;
+}
+
+.use-case-card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    padding: 1.5rem;
+    transition: border-color 0.2s, transform 0.2s;
+}
+
+.use-case-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+}
+
+.use-case-card h3 {
+    font-size: 1.05rem;
+    margin-bottom: 0.75rem;
+    color: var(--text-primary);
+}
+
+.use-case-card p {
+    font-size: 0.95rem;
+    color: var(--text-secondary);
+    line-height: 1.65;
+    margin: 0;
+}
+
+.use-case-card code {
+    font-family: 'Fira Code', monospace;
+    font-size: 0.85rem;
+    color: var(--accent);
+}
+
+.steps {
+    counter-reset: step;
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    margin-top: 3rem;
+}
+
+.step {
+    position: relative;
+    padding: 1.75rem 1.75rem 1.75rem 4.5rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+}
+
+.step::before {
+    counter-increment: step;
+    content: counter(step);
+    position: absolute;
+    left: 1.25rem;
+    top: 1.5rem;
+    width: 2rem;
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: rgba(94, 106, 210, 0.15);
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 0.95rem;
+}
+
+.step h3 {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+    color: var(--text-primary);
+}
+
+.step > p {
+    margin: 0.5rem 0 0;
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.code-block {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    padding: 1.25rem 1.5rem;
+    overflow-x: auto;
+    font-family: 'Fira Code', monospace;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--text-primary);
+    margin: 1rem 0 0;
+}
+
+.code-block .c { color: var(--text-muted); }
+.code-block .s { color: #a5d6ff; }
+.code-block .k { color: #c792ea; }
+.code-block .n { color: #ffcb6b; }
+
+.callout {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-left: 4px solid var(--accent);
+    border-radius: var(--radius-md);
+    padding: 1.25rem 1.5rem;
+    margin: 2rem 0 0;
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.callout h4 {
+    margin: 0 0 0.5rem;
+    color: var(--text-primary);
+    font-size: 1rem;
+}
+
+.callout code {
+    font-family: 'Fira Code', monospace;
+    color: var(--accent);
+}
+
+.two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-top: 2rem;
+}
+
+/* Give code-heavy cards more width: the first two share a row, a .full card
+   spans the whole width. */
+.two-col .full {
+    grid-column: 1 / -1;
+}
+
+.two-col .full .code-block {
+    max-width: 640px;
+}
+
+/* Let grid items shrink below their content so 1fr tracks stay equal and the
+   <pre> scrolls inside its card instead of widening the track and pushing the
+   grid off the right edge. */
+.two-col > *,
+.use-case-grid > * {
+    min-width: 0;
+}
+
+@media (max-width: 768px) {
+    .use-case-grid, .two-col { grid-template-columns: 1fr; }
+    .step { padding-left: 3.5rem; }
+    .step::before { left: 0.9rem; }
 }

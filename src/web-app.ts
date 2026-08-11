@@ -1,4 +1,4 @@
-import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_ACK, DICT_WINDOW, dictFingerprint, roomKeys, currentEpochs, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, AckDart, convKeys } from './core';
+import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_CHAIN_SHARE, TYPE_ACK, DICT_WINDOW, dictFingerprint, roomKeys, currentEpochs, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, ChainShareDart, AckDart, DecryptedData, ChainState, convKeys, seqDelta, seqNext, SEQ_MOD, advanceChain, pairwiseKey, signControlFrame, verifyControlFrame, stripControlFrame } from './core';
 import * as crypto from 'crypto';
 
 // Optional pinned server fingerprint (SHA-256 hex). Set this to the value the
@@ -32,6 +32,18 @@ class WebDartClient {
   private sharedWith = new Map<number, Set<number>>();
   private rekeyTimer: any = null;
   private isCreator = new Map<number, boolean>();
+
+  // Server public key per conversation (from MEMBER_INFO), used to key the
+  // server-verified SYNC / Dict-Reset frames.
+  private serverPubKeys = new Map<number, Buffer>();
+
+  // Per-sender ratchet chains: convId -> epoch -> senderId -> chain state.
+  private senderChains = new Map<number, Map<number, Map<number, ChainState>>>();
+  private chainSharedWith = new Map<number, Set<number>>();
+  private messageKeys = new Map<number, { key: Buffer; idx: number }>();
+  // The epoch this client has adopted (per-client, unlike the shared codec
+  // globals) so each member creates its own ratchet chain.
+  private adoptedEpochs = new Map<number, number>();
   
   // senderId -> seq -> raw buffer
   private outOfOrderBuffer = new Map<number, Map<number, Buffer>>();
@@ -90,13 +102,15 @@ class WebDartClient {
       // Delta-compress against a bounded window of the SAME sender's history so
       // both sides always build identical dictionaries (and older history can
       // be pruned). Since packets from a single sender are strictly ordered by
-      // seq, the window is guaranteed to match when no loss has occurred.
-      const minSeq = Math.max(1, maxSeq - DICT_WINDOW);
+      // seq, the window is guaranteed to match when no loss has occurred. The
+      // window is selected in the modular 24-bit space so it stays correct
+      // across a sequence-number wrap.
       const msgsToConcat: DataDart[] = [];
       
       if (senderId === this.senderId) {
           for (const dart of this.sentMessages.values()) {
-              if (dart.seq >= minSeq && dart.seq < maxSeq) {
+              const dist = seqDelta(dart.seq, maxSeq);
+              if (dist >= 1 && dist <= DICT_WINDOW) {
                   msgsToConcat.push(dart);
               }
           }
@@ -104,15 +118,18 @@ class WebDartClient {
           const msgs = this.receivedMessages.get(senderId);
           if (msgs) {
               for (const dart of msgs.values()) {
-                  if (dart.seq >= minSeq && dart.seq < maxSeq) {
+                  const dist = seqDelta(dart.seq, maxSeq);
+                  if (dist >= 1 && dist <= DICT_WINDOW) {
                       msgsToConcat.push(dart);
                   }
               }
           }
       }
       
-      // Sort strictly by seq to guarantee identical dictionary construction regardless of arrival order
-      msgsToConcat.sort((a, b) => a.seq - b.seq);
+      // Sort oldest-first (largest modular distance from maxSeq) so all
+      // implementations build byte-identical dictionaries regardless of
+      // arrival order, and correctly across a wrap.
+      msgsToConcat.sort((a, b) => seqDelta(b.seq, maxSeq) - seqDelta(a.seq, maxSeq));
       
       const bufs: Buffer[] = [];
       for (const dart of msgsToConcat) {
@@ -123,25 +140,26 @@ class WebDartClient {
 
   // Bound memory: drop history older than the dictionary window (+ slack).
   private pruneSent() {
-      const minSeq = Math.max(1, this.highestSentSeq - DICT_WINDOW - 16);
       for (const k of this.sentMessages.keys()) {
-          if (k < minSeq) this.sentMessages.delete(k);
+          if (seqDelta(k, this.highestSentSeq) > DICT_WINDOW + 16) {
+            this.sentMessages.delete(k);
+            this.messageKeys.delete(k);
+          }
       }
   }
 
   private pruneReceived(senderId: number) {
       const highest = this.highestReceivedSeq.get(senderId) || 0;
-      const minSeq = Math.max(1, highest - DICT_WINDOW - 16);
       const msgs = this.receivedMessages.get(senderId);
       if (msgs) {
           for (const k of msgs.keys()) {
-              if (k < minSeq) msgs.delete(k);
+              if (seqDelta(k, highest) > DICT_WINDOW + 16) msgs.delete(k);
           }
       }
       const nacks = this.nackTimestamps.get(senderId);
       if (nacks) {
           for (const k of nacks.keys()) {
-              if (k < minSeq) nacks.delete(k);
+              if (seqDelta(k, highest) > DICT_WINDOW + 16) nacks.delete(k);
           }
       }
   }
@@ -158,14 +176,25 @@ class WebDartClient {
         this.pendingQueue.push({ convId, payload });
         return;
     }
-    const seq = this.nextSeq++;
+    const epoch = currentEpochs.get(convId) || 1;
+    const myChain = this.getChain(convId, epoch, this.senderId);
+    if (!myChain) {
+        this.pendingQueue.push({ convId, payload });
+        return;
+    }
+    const idx = myChain.index;
+    const { messageKey, state } = advanceChain(myChain, idx);
+    this.setChain(convId, epoch, this.senderId, state);
+    const seq = this.nextSeq;
+    this.nextSeq = seqNext(this.nextSeq);
     const dart: DataDart = { type: TYPE_DATA, convId, senderId: this.senderId, seq, payload };
     this.sentMessages.set(seq, dart);
+    this.messageKeys.set(seq, { key: messageKey, idx });
     this.highestSentSeq = seq;
     this.pruneSent();
     
     const dict = this.getDictionary(this.senderId, seq);
-    const buf = Codec.encodeDataHelper(dart, dict);
+    const buf = Codec.encodeDataHelper(dart, dict, messageKey, idx);
     this.broadcast(buf);
     
     this.clearSyncTimers();
@@ -211,21 +240,29 @@ class WebDartClient {
       const type = buf.readUInt8(0);
       
       if (type === TYPE_DATA) {
-        const dec = Codec.decryptData(buf);
-        const parsedSenderId = dec.senderId;
-        const seq = dec.seq;
-        const convId = dec.convId;
+        const convId = buf.readUInt16BE(1);
+        const seq = buf.readUIntBE(3, 3);
+        const extLen = buf.readUInt8(6);
+        if (extLen < 24) return;
+        const parsedSenderId = buf.readUInt16BE(7);
         
+        const hasBaseline = this.highestReceivedSeq.has(parsedSenderId);
         const highestReceived = this.highestReceivedSeq.get(parsedSenderId) || 0;
-        if (seq <= highestReceived) return; // Already processed
+        // Modular gap test: 0 = duplicate, >= SEQ_MOD/2 = stale, 1 = exact next.
+        // A receiver with no baseline yet treats the first packet as its
+        // baseline, except when the first seq is within the recoverable window:
+        // then NACK the real gap instead of accepting an out-of-order start.
+        const ahead = hasBaseline ? seqDelta(highestReceived, seq) : (seq >= 1 && seq <= DICT_WINDOW ? seq : 1);
+        if (ahead === 0 || ahead >= SEQ_MOD / 2) return; // Already processed
         
-        if (seq > highestReceived + 1) {
+        if (ahead > 1) {
             // Gap detected! Buffer it.
             if (!this.outOfOrderBuffer.has(parsedSenderId)) this.outOfOrderBuffer.set(parsedSenderId, new Map());
             this.outOfOrderBuffer.get(parsedSenderId)!.set(seq, buf);
             
             const missing = [];
-            for (let i = highestReceived + 1; i < seq; i++) {
+            for (let k = 1; k < ahead; k++) {
+                const i = (highestReceived + k) & 0xFFFFFF;
                 if (!this.outOfOrderBuffer.get(parsedSenderId)!.has(i) && !this.receivedMessages.get(parsedSenderId)?.has(i)) {
                     let ts = 0;
                     if (!this.nackTimestamps.has(parsedSenderId)) this.nackTimestamps.set(parsedSenderId, new Map());
@@ -249,30 +286,52 @@ class WebDartClient {
             return; // Buffered, do not process yet!
         }
         
-        // Exact next packet
-        this.processDataPacket(buf, parsedSenderId, seq);
-        this.processBufferedPackets(parsedSenderId);
+        // Exact next packet: decrypt in order, process, then drain the buffer.
+        const dec = this.decryptDataInOrder(buf, parsedSenderId);
+        if (dec) {
+            this.processDataPacket(buf, dec, parsedSenderId, seq);
+            this.processBufferedPackets(parsedSenderId);
+        }
         
+      } else if (type === TYPE_CHAIN_SHARE) {
+        this.handleChainShare(buf);
       } else if (type === TYPE_NACK) {
         this.stats.nacksReceived++;
-        const nack = Codec.decodeNack(buf);
-        if (nack.senderId !== this.senderId) return;
+        const nackConvId = buf.readUInt16BE(1);
+        const nackSenderId = buf.readUInt16BE(3);
+        const nackTargetId = buf.readUInt16BE(5);
+        if (nackTargetId !== this.senderId) return;
+        // Verify the sender's per-sender MAC so a group member can't forge
+        // another member's NACK.
+        const nackPeerPub = this.roster.get(nackConvId)?.get(nackSenderId);
+        const nackStripped = nackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, nackPeerPub)) : null;
+        if (!nackStripped) return;
+        const nack = Codec.decodeNack(nackStripped);
         for (const seq of nack.missingSeq) {
           const dart = this.sentMessages.get(seq);
-          if (dart) {
+          const mk = this.messageKeys.get(seq);
+          if (dart && mk) {
             this.stats.retransmits++;
             const dict = this.getDictionary(this.senderId, seq);
-            const outBuf = Codec.encodeDataHelper(dart, dict);
+            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx);
             this.broadcast(outBuf);
           }
         }
       } else if (type === TYPE_SYNC) {
-        const sync = Codec.decodeSync(buf);
+        // SYNC is keyed to the relay server, which verified and relayed it.
+        const syncStripped = stripControlFrame(buf);
+        if (!syncStripped) return;
+        const sync = Codec.decodeSync(syncStripped);
+        const hasBaseline = this.highestReceivedSeq.has(sync.senderId);
         const highestReceived = this.highestReceivedSeq.get(sync.senderId) || 0;
-        if (sync.highestSeq > highestReceived) {
+        // Fresh receiver: NACK the whole reported range; otherwise only the
+        // modular distance ahead of what we've seen (handles wraps).
+        const ahead = hasBaseline ? seqDelta(highestReceived, sync.highestSeq) : sync.highestSeq;
+        if (ahead > 0 && ahead < SEQ_MOD / 2) {
             const missing = [];
             if (!this.receivedMessages.has(sync.senderId)) this.receivedMessages.set(sync.senderId, new Map());
-            for (let i = highestReceived + 1; i <= sync.highestSeq; i++) {
+            for (let k = 1; k <= ahead; k++) {
+                const i = (highestReceived + k) & 0xFFFFFF;
                 if (!this.outOfOrderBuffer.get(sync.senderId)?.has(i) && !this.receivedMessages.get(sync.senderId)!.has(i)) {
                     let ts = 0;
                     if (!this.nackTimestamps.has(sync.senderId)) this.nackTimestamps.set(sync.senderId, new Map());
@@ -293,14 +352,18 @@ class WebDartClient {
             }
             if (missing.length > 0) {
                 this.sendNack(sync.convId, sync.senderId, missing);
-            } else if (highestReceived === sync.highestSeq) {
-                // Sender is probing but we have everything. Send a positive ACK!
-                this.sendAck(sync.convId, sync.senderId, highestReceived);
             }
         }
       } else if (type === TYPE_ACK) {
-          const ack = Codec.decodeAck(buf);
-          if (ack.targetId === this.senderId && ack.seq >= this.highestSentSeq) {
+          const ackConvId = buf.readUInt16BE(1);
+          const ackSenderId = buf.readUInt16BE(3);
+          const ackTargetId = buf.readUInt16BE(5);
+          if (ackTargetId !== this.senderId) return;
+          const ackPeerPub = this.roster.get(ackConvId)?.get(ackSenderId);
+          const ackStripped = ackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, ackPeerPub)) : null;
+          if (!ackStripped) return;
+          const ack = Codec.decodeAck(ackStripped);
+          if (seqDelta(this.highestSentSeq, ack.seq) < SEQ_MOD / 2) {
               // Message confirmed! Cancel aggressive sync probes.
               this.clearSyncTimers();
           }
@@ -309,7 +372,10 @@ class WebDartClient {
       } else if (type === TYPE_MEMBER_INFO) {
         this.handleMemberInfo(buf);
       } else if (type === 0x06) {
-          const reset = Codec.decodeDictReset(buf);
+          // Dict-Reset is keyed to the relay server, which verified it.
+          const resetStripped = stripControlFrame(buf);
+          if (!resetStripped) return;
+          const reset = Codec.decodeDictReset(resetStripped);
           if (reset.targetId === this.senderId) {
               this.appendSysMsg(`User ${reset.senderId} requested a dictionary reset. Flushing history to recover stream...`);
               this.sentMessages.clear();
@@ -352,14 +418,23 @@ class WebDartClient {
       const rosterMap = new Map<number, Buffer>();
       for (const m of info.members) rosterMap.set(m.senderId, m.pubKey);
       this.roster.set(info.convId, rosterMap);
+      this.serverPubKeys.set(info.convId, serverPubKey);
+      const prevCreator = this.isCreator.get(info.convId) || false;
       this.isCreator.set(info.convId, info.creator);
 
-      const key = convKeys.get(info.convId);
-      if (info.creator && !key) {
+      const myEpoch = this.adoptedEpochs.get(info.convId) || 0;
+      if (info.creator && !myEpoch) {
           this.adoptKey(info.convId, 1, crypto.randomBytes(32));
-      } else if (key) {
+      } else if (myEpoch) {
           this.shareWithNewMembers(info.convId);
       }
+      // If I just became the creator (successor election after the previous
+      // creator left), rotate immediately so the departed member loses access.
+      if (info.creator && !prevCreator && myEpoch) {
+          this.rekey(info.convId);
+      }
+      // Share my ratchet chain with any members that just joined.
+      this.shareChainWithMembers(info.convId, currentEpochs.get(info.convId) || 1);
       this.scheduleRekey(info.convId);
   }
 
@@ -378,19 +453,22 @@ class WebDartClient {
       } catch (e) {
           return;
       }
-      const currentEpoch = currentEpochs.get(convId) || 0;
-      if (!convKeys.get(convId) || decoded.epoch > currentEpoch) {
+      const myEpoch = this.adoptedEpochs.get(convId) || 0;
+      if (!myEpoch || decoded.epoch > myEpoch) {
           this.adoptKey(convId, decoded.epoch, decoded.groupKey);
       }
   }
 
   private adoptKey(convId: number, epoch: number, key: Buffer) {
-      const isNew = !convKeys.has(convId);
+      const isNew = !this.adoptedEpochs.get(convId);
       if (!roomKeys.has(convId)) roomKeys.set(convId, new Map());
       roomKeys.get(convId)!.set(epoch, key);
       convKeys.set(convId, key);
       currentEpochs.set(convId, epoch);
+      this.adoptedEpochs.set(convId, epoch);
       this.sharedWith.set(convId, new Set());
+      // Start a fresh per-sender ratchet chain for this epoch and share it.
+      this.initOwnChain(convId, epoch);
       if (isNew) {
           (document.getElementById('msgInput') as HTMLInputElement).disabled = false;
           (document.getElementById('sendBtn') as HTMLButtonElement).disabled = false;
@@ -412,24 +490,36 @@ class WebDartClient {
       const roster = this.roster.get(convId);
       if (!roster) return;
       const done = this.sharedWith.get(convId) || new Set<number>();
+      const targets: number[] = [];
       for (const [mId] of roster) {
           if (mId === this.senderId || done.has(mId)) continue;
-          const targetPubKey = roster.get(mId)!;
-          const sharedSecret = this.clientECDH.computeSecret(targetPubKey);
-          const transportKey = crypto.createHash('sha256').update(sharedSecret).digest();
-          const share: KeyShareDart = {
-              type: TYPE_KEY_SHARE,
-              convId,
-              senderId: this.senderId,
-              targetId: mId,
-              epoch,
-              nonce: crypto.randomBytes(12),
-              encryptedKey: key
-          };
-          this.broadcast(Codec.encodeKeyShare(share, transportKey));
+          targets.push(mId);
           done.add(mId);
       }
       this.sharedWith.set(convId, done);
+      if (targets.length === 0) return;
+      const doShare = () => {
+          for (const mId of targets) {
+              const targetPubKey = roster.get(mId)!;
+              const sharedSecret = this.clientECDH.computeSecret(targetPubKey);
+              const transportKey = crypto.createHash('sha256').update(sharedSecret).digest();
+              const share: KeyShareDart = {
+                  type: TYPE_KEY_SHARE,
+                  convId,
+                  senderId: this.senderId,
+                  targetId: mId,
+                  epoch,
+                  nonce: crypto.randomBytes(12),
+                  encryptedKey: key
+              };
+              this.broadcast(Codec.encodeKeyShare(share, transportKey));
+          }
+      };
+      doShare();
+      // Retry a couple of times: the group-key share goes over UDP and can be
+      // lost; a member that misses it can't adopt the key or join the room.
+      setTimeout(doShare, 300);
+      setTimeout(doShare, 1000);
   }
 
   private rekey(convId: number) {
@@ -437,6 +527,87 @@ class WebDartClient {
       const current = currentEpochs.get(convId) || 1;
       this.adoptKey(convId, current + 1, crypto.randomBytes(32));
       this.pruneOldEpochs(convId);
+  }
+
+  // ---- Per-sender ratchet chain management ----
+
+  private getChain(convId: number, epoch: number, senderId: number): ChainState | undefined {
+      return this.senderChains.get(convId)?.get(epoch)?.get(senderId);
+  }
+
+  private setChain(convId: number, epoch: number, senderId: number, state: ChainState) {
+      if (!this.senderChains.has(convId)) this.senderChains.set(convId, new Map());
+      const epochs = this.senderChains.get(convId)!;
+      if (!epochs.has(epoch)) epochs.set(epoch, new Map());
+      epochs.get(epoch)!.set(senderId, state);
+  }
+
+  private initOwnChain(convId: number, epoch: number) {
+      const seed = crypto.randomBytes(32);
+      this.setChain(convId, epoch, this.senderId, { key: seed, index: 0 });
+      this.chainSharedWith.set(convId, new Set());
+      this.shareChainWithMembers(convId, epoch);
+  }
+
+  private shareChainWithMembers(convId: number, epoch: number) {
+      const myChain = this.getChain(convId, epoch, this.senderId);
+      const roster = this.roster.get(convId);
+      if (!myChain || !roster) return;
+      const done = this.chainSharedWith.get(convId) || new Set<number>();
+      const targets: number[] = [];
+      for (const [mId] of roster) {
+          if (mId === this.senderId || done.has(mId)) continue;
+          targets.push(mId);
+          done.add(mId);
+      }
+      this.chainSharedWith.set(convId, done);
+      if (targets.length === 0) return;
+      const doShare = () => {
+          for (const mId of targets) {
+              this.sendChainShare(convId, epoch, mId, myChain.key, myChain.index);
+          }
+      };
+      doShare();
+      // Retry a couple of times: the shares go over UDP and a receiver that
+      // misses its only copy can never decrypt this sender's messages.
+      setTimeout(doShare, 300);
+      setTimeout(doShare, 1000);
+  }
+
+  private sendChainShare(convId: number, epoch: number, targetId: number, chainKey: Buffer, chainIndex: number) {
+      const targetPubKey = this.roster.get(convId)?.get(targetId);
+      if (!targetPubKey) return;
+      const sharedSecret = this.clientECDH.computeSecret(targetPubKey);
+      const transportKey = crypto.createHash('sha256').update(sharedSecret).digest();
+      const share: ChainShareDart = {
+          type: TYPE_CHAIN_SHARE,
+          convId,
+          senderId: this.senderId,
+          targetId,
+          epoch,
+          nonce: crypto.randomBytes(12),
+          chainKey,
+          chainIndex
+      };
+      this.broadcast(Codec.encodeChainShare(share, transportKey));
+  }
+
+  private handleChainShare(buf: Buffer) {
+      const convId = buf.readUInt16BE(1);
+      const senderId = buf.readUInt16BE(3);
+      const targetId = buf.readUInt16BE(5);
+      if (targetId !== this.senderId) return;
+      const sharerPubKey = this.roster.get(convId)?.get(senderId);
+      if (!sharerPubKey) return;
+      const sharedSecret = this.clientECDH.computeSecret(sharerPubKey);
+      const transportKey = crypto.createHash('sha256').update(sharedSecret).digest();
+      let decoded;
+      try {
+          decoded = Codec.decodeChainShare(buf, transportKey);
+      } catch (e) {
+          return;
+      }
+      this.setChain(convId, decoded.epoch, decoded.senderId, { key: decoded.chainKey, index: decoded.chainIndex });
   }
 
   private scheduleRekey(convId: number) {
@@ -454,8 +625,23 @@ class WebDartClient {
       }
   }
 
-  private processDataPacket(buf: Buffer, parsedSenderId: number, seq: number) {
-      const dec = Codec.decryptData(buf);
+  private decryptDataInOrder(buf: Buffer, senderId: number): DecryptedData | null {
+      const epoch = buf.readUInt16BE(21);
+      const idx = buf.readUInt32BE(27);
+      const convId = buf.readUInt16BE(1);
+      const chain = this.getChain(convId, epoch, senderId);
+      if (!chain || idx < chain.index) return null;
+      const { messageKey, state } = advanceChain(chain, idx);
+      try {
+          const dec = Codec.decryptData(buf, messageKey);
+          this.setChain(convId, epoch, senderId, state);
+          return dec;
+      } catch (e) {
+          return null;
+      }
+  }
+
+  private processDataPacket(buf: Buffer, dec: DecryptedData, parsedSenderId: number, seq: number) {
       if (dec.senderId !== parsedSenderId) return;
       
       const dict = this.getDictionary(parsedSenderId, seq);
@@ -487,7 +673,8 @@ class WebDartClient {
       
       if (!this.receivedMessages.get(dart.senderId)!.has(dart.seq)) {
           this.receivedMessages.get(dart.senderId)!.set(dart.seq, dart);
-          if (dart.seq > highestReceived) {
+          const d = this.highestReceivedSeq.has(dart.senderId) ? seqDelta(highestReceived, dart.seq) : 1;
+          if (d > 0 && d < SEQ_MOD / 2) {
               this.highestReceivedSeq.set(dart.senderId, dart.seq);
           }
           this.pruneReceived(dart.senderId);
@@ -507,15 +694,22 @@ class WebDartClient {
   }
   
   private processBufferedPackets(senderId: number) {
-      let nextSeq = (this.highestReceivedSeq.get(senderId) || 0) + 1;
+      let nextSeq = seqNext(this.highestReceivedSeq.get(senderId) || 0);
       const bufferMap = this.outOfOrderBuffer.get(senderId);
       if (!bufferMap) return;
       
       while (bufferMap.has(nextSeq)) {
           const buf = bufferMap.get(nextSeq)!;
           bufferMap.delete(nextSeq);
-          this.processDataPacket(buf, senderId, nextSeq);
-          nextSeq++;
+          try {
+              const dec = this.decryptDataInOrder(buf, senderId);
+              if (dec && dec.senderId === senderId) {
+                  this.processDataPacket(buf, dec, senderId, nextSeq);
+              }
+          } catch (e) {
+              // Bad buffered packet
+          }
+          nextSeq = seqNext(nextSeq);
       }
   }
   
@@ -524,7 +718,8 @@ class WebDartClient {
       this.receivedMessages.get(senderId)!.set(lostSeq, { type: TYPE_DATA, convId, senderId, seq: lostSeq, payload: "" });
       
       const highestReceived = this.highestReceivedSeq.get(senderId) || 0;
-      if (lostSeq > highestReceived) {
+      const d = seqDelta(highestReceived, lostSeq);
+      if (d > 0 && d < SEQ_MOD / 2) {
           this.highestReceivedSeq.set(senderId, lostSeq);
       }
       
@@ -536,26 +731,35 @@ class WebDartClient {
   private sendDictReset(convId: number, targetId: number) {
       const reset = { type: 0x06, convId, senderId: this.senderId, targetId };
       const buf = Codec.encodeDictReset(reset);
-      this.broadcast(buf);
+      const serverPub = this.serverPubKeys.get(convId);
+      if (!serverPub) return;
+      this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
   }
   
   private sendAck(convId: number, targetId: number, seq: number) {
       const ack = { type: TYPE_ACK, convId, senderId: this.senderId, targetId, seq };
-      this.broadcast(Codec.encodeAck(ack));
+      const buf = Codec.encodeAck(ack);
+      const peerPub = this.roster.get(convId)?.get(targetId);
+      if (!peerPub) return;
+      this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
   }
   
-  private sendNack(convId: number, senderId: number, missingSeq: number[]) {
+  private sendNack(convId: number, targetId: number, missingSeq: number[]) {
     this.stats.nacksSent++;
-    const nack: NackDart = { type: TYPE_NACK, convId, senderId, missingSeq };
+    const nack: NackDart = { type: TYPE_NACK, convId, senderId: this.senderId, targetId, missingSeq };
     const buf = Codec.encodeNack(nack);
-    this.broadcast(buf);
+    const peerPub = this.roster.get(convId)?.get(targetId);
+    if (!peerPub) return;
+    this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
   }
   
   private sendSync(convId: number) {
       if (this.highestSentSeq === 0) return;
       const sync: SyncDart = { type: TYPE_SYNC, convId, senderId: this.senderId, highestSeq: this.highestSentSeq };
       const buf = Codec.encodeSync(sync);
-      this.broadcast(buf);
+      const serverPub = this.serverPubKeys.get(convId);
+      if (!serverPub) return;
+      this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
   }
   
   private appendChat(text: string) {
