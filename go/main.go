@@ -1117,7 +1117,13 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 		c.serverPubKeys[info.ConvId] = serverPub
 		prevCreator := c.isCreator[info.ConvId]
 		c.isCreator[info.ConvId] = info.Creator
+		// Snapshot whether we already held a group key BEFORE this handler, so
+		// the "I just became the creator" rekey only fires on a real successor
+		// election (an existing member being promoted), not on the very first
+		// join where adoptKey has just created the key.
+		hadKeyBefore := false
 		if _, has := c.codec.ConvKeys[info.ConvId]; has {
+			hadKeyBefore = true
 			c.shareWithNewMembers(info.ConvId)
 		} else if info.Creator {
 			key := make([]byte, 32)
@@ -1126,10 +1132,8 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 		}
 		// If I just became the creator (successor election after the previous
 		// creator left), rotate immediately so the departed member loses access.
-		if info.Creator && !prevCreator {
-			if _, has := c.codec.ConvKeys[info.ConvId]; has {
-				c.doRekey(info.ConvId)
-			}
+		if info.Creator && !prevCreator && hadKeyBefore {
+			c.doRekey(info.ConvId)
 		}
 		// Share my ratchet chain with any members that just joined.
 		epoch := c.codec.CurrentEpochs[info.ConvId]
