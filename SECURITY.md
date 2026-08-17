@@ -28,10 +28,15 @@ See also the [Roadmap](README.md#-roadmap--todo) in the README.
 - **Pinning is not a public PKI.** Server authentication relies on out-of-band
   fingerprint distribution (`DART_SERVER_FINGERPRINT`); there are no
   certificates or certificate authorities.
-- **Routing metadata is cleartext.** Conversation IDs, sequence numbers and
-  control signalling are visible on the wire; the server knows who talks to
-  whom in which room (content is end-to-end encrypted, the server is blind to
-  it).
+- **No room access control.** Knowing a 16-bit conversation ID is enough to
+  send `KEY_REQ`. Pinning authenticates the server, not members. `senderId` is
+  client-chosen; the server only refuses to bind one id to two different
+  public keys.
+- **Routing metadata is cleartext.** Conversation IDs, sequence numbers, NACK
+  gap lists and control signalling are visible on the wire; the server knows
+  who talks to whom in which room (content is end-to-end encrypted, the server
+  is blind to it). The gap list is deliberately readable so the relay can
+  repair from cache without holding a group key.
 - **Control frames are per-sender authenticated.** ACK / NACK carry an
   ECDH-derived per-sender HMAC verified by the target member (a group member
   cannot forge another member's ACK or NACK); SYNC / Dict-Reset are keyed to

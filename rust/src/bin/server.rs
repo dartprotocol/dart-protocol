@@ -540,6 +540,10 @@ async fn handle_message(
                 if first {
                     s.creator.insert(req.conv_id, req.sender_id);
                 }
+                // Last-writer-wins: a client reconnects with a fresh ECDH keypair
+                // on every restart (UDP peers have no close event), so the roster
+                // binding must follow the latest KeyReq or reconnects are locked
+                // out permanently.
                 s.members.entry(req.conv_id).or_default().insert(req.sender_id, req.client_pub_key.clone());
             }
             notify_members(req.conv_id, &state, &socket).await;
@@ -565,7 +569,7 @@ async fn handle_message(
                 Some(s) => s,
                 None => return,
             };
-            let nack = match codec.decode_nack(&stripped) {
+            let nack = match Codec::parse_nack(&stripped) {
                 Ok(n) => n,
                 Err(_) => return,
             };
@@ -607,9 +611,21 @@ async fn handle_message(
                 send_to_peer(&cached, &peer_id, &state, &socket).await;
             }
 
-            if !missing_from_server.is_empty() {
-                // Relay the original member-signed NACK verbatim so the target
-                // member (and any peer holding the messages) can act on it.
+            // Always relay the member-signed NACK to the target member (the
+            // data sender): the cache repair alone cannot fix a receiver that
+            // also lost the sender's ratchet-chain share, and only the sender
+            // can re-share it.
+            let target_peer = {
+                let s = state.read().await;
+                s.client_map.get(&nack.conv_id).and_then(|m| m.get(&nack.target_id)).cloned()
+            };
+            if let Some(tp) = target_peer {
+                if tp != peer_id {
+                    send_to_peer(&msg, &tp, &state, &socket).await;
+                }
+            } else if !missing_from_server.is_empty() {
+                // Fall back to the group relay so any peer holding the
+                // messages can act on it.
                 println!("[Server] Relaying NACK for missing seqs {:?}", missing_from_server);
                 for p in group {
                     send_to_peer(&msg, &p, &state, &socket).await;

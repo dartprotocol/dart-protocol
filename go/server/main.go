@@ -104,6 +104,20 @@ func NewDartGroupServer() *DartGroupServer {
 	}
 }
 
+// cloneUDPAddr copies IP bytes. Go 1.15's ReadFromUDP aliases the syscall
+// sockaddr (`IP: sa.Addr[0:]`), so storing raddr and reading another packet
+// mutates the first peer's address. Rust copies SocketAddr; we must too.
+func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
+	if a == nil {
+		return nil
+	}
+	dup := *a
+	if a.IP != nil {
+		dup.IP = append(net.IP(nil), a.IP...)
+	}
+	return &dup
+}
+
 func (s *DartGroupServer) StartUDP(port int) {
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -131,7 +145,7 @@ func (s *DartGroupServer) StartUDP(port int) {
 		peer := &Peer{
 			ID:      peerID,
 			Type:    PeerUDP,
-			UDPAddr: raddr,
+			UDPAddr: cloneUDPAddr(raddr),
 		}
 		
 		go s.handleMessage(msg, peer)
@@ -190,7 +204,7 @@ func (s *DartGroupServer) joinGroup(convId uint16, peer *Peer) {
 			
 			// Update the peer in place so we keep its state/socket
 			if p.Type == PeerUDP {
-				p.UDPAddr = peer.UDPAddr
+				p.UDPAddr = cloneUDPAddr(peer.UDPAddr)
 			}
 			break
 		}
@@ -492,6 +506,9 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 			s.members[req.ConvId] = make(map[uint16][]byte)
 			s.creator[req.ConvId] = req.SenderId
 		}
+		// Last-writer-wins: a client reconnects with a fresh ECDH keypair on
+		// every restart (UDP peers have no close event), so the roster binding
+		// must follow the latest KeyReq or reconnects are locked out permanently.
 		s.members[req.ConvId][req.SenderId] = req.ClientPubKey
 		s.mu.Unlock()
 		s.notifyMembers(req.ConvId)
@@ -510,6 +527,8 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		s.mu.Unlock()
 		if targetPeer != nil {
 			s.sendToPeer(buf, targetPeer)
+		} else {
+			log.Printf("[Server] Dropping share: no peer for target %d conv %d", targetId, convId)
 		}
 
 	case core.TypeNack:
@@ -517,7 +536,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if !ok {
 			return
 		}
-		nack, err := s.codec.DecodeNack(nackStripped)
+		nack, err := core.ParseNack(nackStripped)
 		if err != nil {
 			return
 		}
@@ -538,11 +557,17 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		}
 		group := make([]*Peer, len(s.groups[nack.ConvId]))
 		copy(group, s.groups[nack.ConvId])
+		targetPeer := s.clientMap[nack.ConvId][nack.TargetId]
 		s.mu.Unlock()
-		
-		if len(missingFromServer) > 0 {
-			// Relay the original member-signed NACK verbatim so the target
-			// member (and any peer holding the messages) can act on it.
+
+		// Always relay the member-signed NACK to the target member (the data
+		// sender): the cache repair alone cannot fix a receiver that also lost
+		// the sender's ratchet-chain share, and only the sender can re-share it.
+		if targetPeer != nil && targetPeer.ID != actualPeer.ID {
+			s.sendToPeer(buf, targetPeer)
+		} else if len(missingFromServer) > 0 {
+			// Fall back to the group relay so any peer holding the messages
+			// can act on it.
 			for _, p := range group {
 				if p.ID != actualPeer.ID {
 					s.sendToPeer(buf, p)

@@ -28,6 +28,7 @@
       "electron-main.js",
       "public/**/*",
       "!public/*.zip",
+      "!public/*.exe",
       "src/**/*.js",
       "package.json"
     ]

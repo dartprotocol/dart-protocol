@@ -124,72 +124,70 @@ impl Codec {
         String::from_utf8(payload_bytes).map_err(|_| "invalid utf8".to_string())
     }
 
+    fn nack_prefix_len(missing_count: usize) -> usize {
+        21 + missing_count * 3
+    }
+
+    // Gap list is cleartext so a blind relay can repair from cache without
+    // the group key. GCM authenticates empty plaintext; the prefix is AAD.
+    pub fn parse_nack(buf: &[u8]) -> Result<NackDart, String> {
+        if buf.len() < 21 {
+            return Err("buffer too short".to_string());
+        }
+        let count = BigEndian::read_u16(&buf[19..21]) as usize;
+        let header_len = Self::nack_prefix_len(count);
+        if buf.len() < header_len {
+            return Err("buffer too short".to_string());
+        }
+        let mut missing_seq = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 21 + i * 3;
+            missing_seq.push(read_u24(&buf[off..off + 3]));
+        }
+        Ok(NackDart {
+            conv_id: BigEndian::read_u16(&buf[1..3]),
+            sender_id: BigEndian::read_u16(&buf[3..5]),
+            target_id: BigEndian::read_u16(&buf[5..7]),
+            missing_seq,
+        })
+    }
+
     pub fn encode_nack(&self, nack: &NackDart, nonce: Option<[u8; 12]>) -> Result<Vec<u8>, String> {
         let conv_key = self.get_conv_key(nack.conv_id)?;
 
-        // 19-byte cleartext header: type(1) | convId(2) | senderId(2) |
-        // targetId(2) | nonce(12). senderId is the member who detected the gap
-        // (the signer); targetId is the member whose stream has the gap.
         let nonce = nonce.unwrap_or_else(rand::random);
-
-        let mut header = vec![0u8; 19];
+        let header_len = Self::nack_prefix_len(nack.missing_seq.len());
+        let mut header = vec![0u8; header_len];
         header[0] = TYPE_NACK;
         BigEndian::write_u16(&mut header[1..3], nack.conv_id);
         BigEndian::write_u16(&mut header[3..5], nack.sender_id);
         BigEndian::write_u16(&mut header[5..7], nack.target_id);
         header[7..19].copy_from_slice(&nonce);
-
-        let mut payload = vec![0u8; 2 + nack.missing_seq.len() * 3];
-        BigEndian::write_u16(&mut payload[0..2], nack.missing_seq.len() as u16);
-        let mut offset = 2;
-        for &seq in &nack.missing_seq {
-            write_u24(&mut payload[offset..offset + 3], seq);
-            offset += 3;
+        BigEndian::write_u16(&mut header[19..21], nack.missing_seq.len() as u16);
+        for (i, &seq) in nack.missing_seq.iter().enumerate() {
+            write_u24(&mut header[21 + i * 3..24 + i * 3], seq);
         }
 
         let mut res = header.clone();
-        let ciphertext = encrypt_gcm(&conv_key, &nonce, &payload, &header)
+        let ciphertext = encrypt_gcm(&conv_key, &nonce, &[], &header)
             .map_err(|e| format!("encrypt err: {:?}", e))?;
         res.extend_from_slice(&ciphertext);
         Ok(res)
     }
 
     pub fn decode_nack(&self, buf: &[u8]) -> Result<NackDart, String> {
-        if buf.len() < 19 {
+        let nack = Self::parse_nack(buf)?;
+        let header_len = Self::nack_prefix_len(nack.missing_seq.len());
+        if buf.len() < header_len + 16 {
             return Err("buffer too short".to_string());
         }
-        let conv_id = BigEndian::read_u16(&buf[1..3]);
-        let sender_id = BigEndian::read_u16(&buf[3..5]);
-        let target_id = BigEndian::read_u16(&buf[5..7]);
-        let header = &buf[..19];
-        let nonce = &buf[7..19];
-        let encrypted = &buf[19..];
-
-        let conv_key = self.get_conv_key(conv_id)?;
-
-        let payload = decrypt_gcm(&conv_key, nonce, encrypted, header)
+        let header = &buf[..header_len];
+        let nonce = &header[7..19];
+        let tag = &buf[header_len..];
+        let conv_key = self.get_conv_key(nack.conv_id)?;
+        decrypt_gcm(&conv_key, nonce, tag, header)
             .map_err(|e| format!("decrypt err: {:?}", e))?;
-
-        if payload.len() < 2 {
-            return Err("invalid nack payload".to_string());
-        }
-        let count = BigEndian::read_u16(&payload[0..2]) as usize;
-        let mut missing_seq = Vec::with_capacity(count);
-        let mut offset = 2;
-        for _ in 0..count {
-            if payload.len() < offset + 3 {
-                break;
-            }
-            missing_seq.push(read_u24(&payload[offset..offset + 3]));
-            offset += 3;
-        }
-
-        Ok(NackDart {
-            conv_id,
-            sender_id,
-            target_id,
-            missing_seq,
-        })
+        Ok(nack)
     }
 
     pub fn encode_sync(&self, sync: &SyncDart, nonce: Option<[u8; 12]>) -> Result<Vec<u8>, String> {
@@ -760,7 +758,7 @@ mod tests {
         let c = test_codec();
         let nack = NackDart { conv_id: 1, sender_id: 7, target_id: 9, missing_seq: vec![1, 2, 3] };
         assert_hex("nack", &c.encode_nack(&nack, Some(NONCE)).unwrap(),
-            "02000100070009000102030405060708090a0b13e0b6137aa335f614b8d0b1113eab3b1b2b9066d92634fe4bc878");
+            "02000100070009000102030405060708090a0b00030000010000020000036e3fdcea13a7d1a81d67e2a9149581c4");
         let sync = SyncDart { conv_id: 1, sender_id: 7, highest_seq: 99 };
         assert_hex("sync", &c.encode_sync(&sync, Some(NONCE)).unwrap(),
             "0300010007000102030405060708090a0b13e3d5bb7fdb1913e44d8c593cb1542f296d51");

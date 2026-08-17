@@ -4,62 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dart Protocol V2 | WebTransport Roadmap</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@500&display=swap" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
-    <style>
-        .v2-header {
-            padding: 10rem 0 4rem;
-            text-align: center;
-        }
-        
-        .article {
-            max-width: 760px;
-            margin: 0 auto;
-            padding-bottom: 8rem;
-        }
-        
-        .article h2 {
-            font-size: 2rem;
-            color: var(--text-primary);
-            margin: 4rem 0 1.5rem;
-            letter-spacing: -0.02em;
-        }
-        
-        .article p {
-            font-size: 1.1rem;
-            color: var(--text-secondary);
-            margin-bottom: 1.5rem;
-            line-height: 1.8;
-        }
-        
-        .article ul {
-            margin-bottom: 2rem;
-            padding-left: 1.5rem;
-            color: var(--text-secondary);
-        }
-        
-        .article li {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-            line-height: 1.6;
-        }
-        
-        .article li strong {
-            color: var(--text-primary);
-        }
-        
-        .highlight-box {
-            background: var(--bg-elevated);
-            border: 1px solid var(--border-strong);
-            border-left: 4px solid var(--accent);
-            padding: 2rem;
-            margin: 3rem 0;
-            border-radius: 0 var(--radius-md) var(--radius-md) 0;
-            font-size: 1.15rem;
-            color: var(--text-primary);
-            line-height: 1.7;
-        }
-    </style>
 </head>
 <body>
     <div class="bg-mesh"></div>
@@ -128,9 +76,9 @@
             </ul>
 
             <h2>Current Testing Status</h2>
-            <p>Dart V2 is currently heavily experimental. While the core Datagram routing logic is functional, WebTransport imposes strict TLS certificate requirements (unlike WebSockets, which allow unencrypted <code>ws://</code> during local development). We are currently finalizing the HTTP/3 proxy layer and local development certificate injection.</p>
+            <p>V2 is a design sketch. There is no WebTransport or QUIC code in this repository yet. Native clients already speak UDP; the browser client is still on WebSocket (and therefore still inherits TCP head-of-line blocking). A future V2 would need a QUIC listener, a <code>WebTransport.datagrams</code> client, and a real TLS story for local development.</p>
 
-            <div style="margin-top: 4rem; text-align: center;">
+            <div style="margin-top: 2rem;">
                 <a href="index.html" class="btn btn-secondary">Return to V1 Baseline</a>
             </div>
         </article>

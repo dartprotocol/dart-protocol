@@ -70,6 +70,7 @@ export class DartGroupServer {
     private highestSeq = new Map<number, Map<number, number>>();
 
     public stats = { packetsReceived: 0, packetsSent: 0, nacksReceived: 0, nacksSent: 0, repairsSent: 0 };
+    private closed = false;
 
     constructor(port: number) {
         this.serverECDH = this.loadOrCreateServerKey();
@@ -198,7 +199,9 @@ export class DartGroupServer {
     }
     
     private sendToPeer(buf: Buffer, peer: Peer) {
+        if (this.closed) return;
         this.stats.packetsSent++;
+        try {
         if (peer.type === 'udp' && peer.address && peer.port) {
             this.udpSocket.send(buf, peer.port, peer.address);
         } else if (peer.type === 'tcp' && peer.tcpSocket) {
@@ -208,6 +211,9 @@ export class DartGroupServer {
             peer.tcpSocket.write(out);
         } else if (peer.type === 'ws' && peer.ws && peer.ws.readyState === WebSocket.OPEN) {
             peer.ws.send(buf);
+        }
+        } catch (e) {
+            // Socket already closed during shutdown.
         }
     }
     
@@ -236,9 +242,10 @@ export class DartGroupServer {
             this.joinGroup(convId, peer);
             
             // Track senderId to peer mapping for targeted routing (like ACKs).
-            // Data darts no longer carry a cleartext senderId (7-byte header), so
-            // identity is learned from control packets (KeyReq/NACK/SYNC/ACK) and
-            // remembered per transport peer.
+            // Data darts carry a cleartext senderId in the extension, but identity
+            // is still learned from control packets (KeyReq/NACK/SYNC/ACK) and
+            // remembered per transport peer so a new socket cannot spoof another
+            // member just by writing their id on a Data dart.
             if (type !== TYPE_DATA && buf.length >= 5) {
                 const senderId = buf.readUInt16BE(3);
                 this.peerIdentity.set(peer.id, senderId);
@@ -307,6 +314,10 @@ export class DartGroupServer {
                     this.members.set(req.convId, new Map());
                     this.creator.set(req.convId, req.senderId);
                 }
+                // Last-writer-wins: a client reconnects with a fresh ECDH keypair
+                // on every restart (UDP peers have no close event), so the roster
+                // binding must follow the latest KeyReq or reconnects are locked
+                // out permanently.
                 this.members.get(req.convId)!.set(req.senderId, req.clientPubKey);
 
                 // Notify every member (including the joiner) with the roster.
@@ -322,7 +333,13 @@ export class DartGroupServer {
                 this.stats.nacksReceived++;
                 const nackStripped = stripControlFrame(buf);
                 if (!nackStripped) return;
-                const nack = Codec.decodeNack(nackStripped);
+                // Gap list is cleartext: a blind server can repair without the group key.
+                let nack;
+                try {
+                    nack = Codec.parseNack(nackStripped);
+                } catch (e) {
+                    return;
+                }
                 
                 const missingFromServer = [];
                 for (const seq of nack.missingSeq) {
@@ -335,10 +352,16 @@ export class DartGroupServer {
                     }
                 }
                 
-                if (missingFromServer.length > 0) {
-                    // Relay the original member-signed NACK verbatim so the
-                    // target member (and any peer holding the messages) can act
-                    // on it; the target verifies the sender's per-sender MAC.
+                // Always relay the member-signed NACK to the target member (the
+                // data sender): the cache repair alone cannot fix a receiver
+                // that also lost the sender's ratchet-chain share, and only
+                // the sender can re-share it.
+                const targetPeer = this.clientMap.get(nack.convId)?.get(nack.targetId);
+                if (targetPeer && targetPeer.id !== peer.id) {
+                    this.sendToPeer(buf, targetPeer);
+                } else if (missingFromServer.length > 0) {
+                    // Fall back to the group relay so any peer holding the
+                    // messages can act on it.
                     for (const p of (this.groups.get(nack.convId) || [])) {
                         if (p.id !== peer.id) {
                             this.sendToPeer(buf, p);
@@ -390,6 +413,7 @@ export class DartGroupServer {
     }
     
     close() {
+        this.closed = true;
         this.udpSocket.close();
         this.tcpServer.close();
         this.wss.close();

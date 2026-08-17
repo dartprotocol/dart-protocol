@@ -1,4 +1,4 @@
-import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_CHAIN_SHARE, TYPE_ACK, DICT_WINDOW, dictFingerprint, roomKeys, currentEpochs, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, ChainShareDart, AckDart, DecryptedData, ChainState, convKeys, seqDelta, seqNext, SEQ_MOD, advanceChain, pairwiseKey, signControlFrame, verifyControlFrame, stripControlFrame } from './core';
+import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_CHAIN_SHARE, TYPE_ACK, DICT_WINDOW, dictFingerprint, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, ChainShareDart, AckDart, DecryptedData, ChainState, seqDelta, seqNext, SEQ_MOD, advanceChain, pairwiseKey, signControlFrame, verifyControlFrame, stripControlFrame } from './core';
 import * as crypto from 'crypto';
 
 // Optional pinned server fingerprint (SHA-256 hex). Set this to the value the
@@ -20,6 +20,7 @@ class WebDartClient {
   public stats = { packetsSent: 0, packetsReceived: 0, nacksSent: 0, nacksReceived: 0, retransmits: 0, bytesSent: 0 };
   
   private syncTimers: any[] = [];
+  private ackedSeq = new Map<number, number>();
   private ackTimers = new Map<number, any>(); // targetId -> timer
 
   private clientECDH!: crypto.ECDH;
@@ -41,9 +42,16 @@ class WebDartClient {
   private senderChains = new Map<number, Map<number, Map<number, ChainState>>>();
   private chainSharedWith = new Map<number, Set<number>>();
   private messageKeys = new Map<number, { key: Buffer; idx: number }>();
+  private chainSeeds = new Map<number, Map<number, ChainState>>(); // convId -> epoch -> index-0 chain state
   // The epoch this client has adopted (per-client, unlike the shared codec
   // globals) so each member creates its own ratchet chain.
   private adoptedEpochs = new Map<number, number>();
+  private roomKeys = new Map<number, Map<number, Buffer>>();
+  private currentEpochs = new Map<number, number>();
+
+  private getCurrentKey(convId: number): Buffer | undefined {
+    return this.roomKeys.get(convId)?.get(this.currentEpochs.get(convId) || 1);
+  }
   
   // senderId -> seq -> raw buffer
   private outOfOrderBuffer = new Map<number, Map<number, Buffer>>();
@@ -172,11 +180,11 @@ class WebDartClient {
     }
     this.lastSendTime = now;
     
-    if (!convKeys.has(convId)) {
+    if (!this.getCurrentKey(convId)) {
         this.pendingQueue.push({ convId, payload });
         return;
     }
-    const epoch = currentEpochs.get(convId) || 1;
+    const epoch = this.currentEpochs.get(convId) || 1;
     const myChain = this.getChain(convId, epoch, this.senderId);
     if (!myChain) {
         this.pendingQueue.push({ convId, payload });
@@ -194,16 +202,23 @@ class WebDartClient {
     this.pruneSent();
     
     const dict = this.getDictionary(this.senderId, seq);
-    const buf = Codec.encodeDataHelper(dart, dict, messageKey, idx);
+    const buf = Codec.encodeDataHelper(dart, dict, messageKey, idx, epoch);
     this.broadcast(buf);
     
     this.clearSyncTimers();
-    this.syncTimers.push(setTimeout(() => {
-        this.sendSync(convId);
-    }, 300));
-    this.syncTimers.push(setTimeout(() => {
-        this.sendSync(convId);
-    }, 1000));
+    this.syncProbe(convId);
+  }
+  
+  private syncProbe(convId: number) {
+      this.syncTimers.push(setTimeout(() => {
+          this.sendSync(convId);
+          // Re-arm while the latest message stays unacknowledged so SYNC-driven
+          // NACK repair keeps retrying under loss.
+          const acked = this.ackedSeq.get(convId) || 0;
+          if (seqDelta(this.highestSentSeq, acked) >= SEQ_MOD / 2) {
+              this.syncProbe(convId);
+          }
+      }, 300));
   }
   
   private clearSyncTimers() {
@@ -224,6 +239,23 @@ class WebDartClient {
           this.ws.send(new Uint8Array(Codec.encodeKeyReq(req)));
       }
       this.appendSysMsg(`Joining room ${roomId}...`);
+      // Retry: each KeyReq makes the server re-notify the roster, which is
+      // how members refresh stale pubkeys (MEMBER_INFO has no other retry).
+      setTimeout(() => {
+          if (this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(new Uint8Array(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })));
+          }
+      }, 1000);
+      setTimeout(() => {
+          if (this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(new Uint8Array(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })));
+          }
+      }, 2000);
+      setTimeout(() => {
+          if (this.ws.readyState === WebSocket.OPEN) {
+              this.ws.send(new Uint8Array(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })));
+          }
+      }, 3000);
   }
   
   private broadcast(buf: Buffer) {
@@ -306,22 +338,37 @@ class WebDartClient {
         const nackPeerPub = this.roster.get(nackConvId)?.get(nackSenderId);
         const nackStripped = nackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, nackPeerPub)) : null;
         if (!nackStripped) return;
-        const nack = Codec.decodeNack(nackStripped);
+        const nackKey = this.getCurrentKey(nackConvId);
+        if (!nackKey) return;
+        const nack = Codec.decodeNack(nackStripped, nackKey);
         for (const seq of nack.missingSeq) {
           const dart = this.sentMessages.get(seq);
           const mk = this.messageKeys.get(seq);
           if (dart && mk) {
             this.stats.retransmits++;
             const dict = this.getDictionary(this.senderId, seq);
-            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx);
+            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, this.currentEpochs.get(dart.convId) || 1);
             this.broadcast(outBuf);
+          }
+        }
+        // The NACKer likely missed the chain share too (it can't decrypt my
+        // stream without one). Re-share the current chain state: it's
+        // deterministic, so receiving it is always safe.
+        const epoch = this.currentEpochs.get(nackConvId) || 1;
+        const myChain = this.getChain(nackConvId, epoch, this.senderId);
+        if (myChain) {
+          const seed = this.chainSeeds.get(nackConvId)?.get(epoch);
+          if (seed) {
+            this.sendChainShare(nackConvId, epoch, nackSenderId, seed.key, seed.index);
           }
         }
       } else if (type === TYPE_SYNC) {
         // SYNC is keyed to the relay server, which verified and relayed it.
         const syncStripped = stripControlFrame(buf);
         if (!syncStripped) return;
-        const sync = Codec.decodeSync(syncStripped);
+        const syncKey = this.getCurrentKey(syncStripped.readUInt16BE(1));
+        if (!syncKey) return;
+        const sync = Codec.decodeSync(syncStripped, syncKey);
         const hasBaseline = this.highestReceivedSeq.has(sync.senderId);
         const highestReceived = this.highestReceivedSeq.get(sync.senderId) || 0;
         // Fresh receiver: NACK the whole reported range; otherwise only the
@@ -362,10 +409,14 @@ class WebDartClient {
           const ackPeerPub = this.roster.get(ackConvId)?.get(ackSenderId);
           const ackStripped = ackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, ackPeerPub)) : null;
           if (!ackStripped) return;
-          const ack = Codec.decodeAck(ackStripped);
+          const ackKey = this.getCurrentKey(ackConvId);
+          if (!ackKey) return;
+          const ack = Codec.decodeAck(ackStripped, ackKey);
           if (seqDelta(this.highestSentSeq, ack.seq) < SEQ_MOD / 2) {
-              // Message confirmed! Cancel aggressive sync probes.
-              this.clearSyncTimers();
+              // Record the ACK; the re-arming sync probe stops on its own once
+              // the latest message is acknowledged (clearing it here on a stale
+              // ACK would silence repair probes prematurely).
+              this.ackedSeq.set(ackConvId, ack.seq);
           }
       } else if (type === TYPE_KEY_SHARE) {
         this.handleKeyShare(buf);
@@ -375,7 +426,9 @@ class WebDartClient {
           // Dict-Reset is keyed to the relay server, which verified it.
           const resetStripped = stripControlFrame(buf);
           if (!resetStripped) return;
-          const reset = Codec.decodeDictReset(resetStripped);
+          const resetKey = this.getCurrentKey(resetStripped.readUInt16BE(1));
+          if (!resetKey) return;
+          const reset = Codec.decodeDictReset(resetStripped, resetKey);
           if (reset.targetId === this.senderId) {
               this.appendSysMsg(`User ${reset.senderId} requested a dictionary reset. Flushing history to recover stream...`);
               this.sentMessages.clear();
@@ -417,7 +470,22 @@ class WebDartClient {
 
       const rosterMap = new Map<number, Buffer>();
       for (const m of info.members) rosterMap.set(m.senderId, m.pubKey);
+      const prevRoster = this.roster.get(info.convId);
       this.roster.set(info.convId, rosterMap);
+      if (prevRoster) {
+        // A member whose pubkey changed (reconnect with a fresh ECDH keypair)
+        // needs fresh group-key and chain shares under the new key; drop the
+        // shared-with flags so the shares are re-sent.
+        const keyDone = this.sharedWith.get(info.convId);
+        const chainDone = this.chainSharedWith.get(info.convId);
+        for (const [mId, pub] of rosterMap) {
+          const prev = prevRoster.get(mId);
+          if (prev && !prev.equals(pub)) {
+            keyDone?.delete(mId);
+            chainDone?.delete(mId);
+          }
+        }
+      }
       this.serverPubKeys.set(info.convId, serverPubKey);
       const prevCreator = this.isCreator.get(info.convId) || false;
       this.isCreator.set(info.convId, info.creator);
@@ -434,7 +502,7 @@ class WebDartClient {
           this.rekey(info.convId);
       }
       // Share my ratchet chain with any members that just joined.
-      this.shareChainWithMembers(info.convId, currentEpochs.get(info.convId) || 1);
+      this.shareChainWithMembers(info.convId, this.currentEpochs.get(info.convId) || 1);
       this.scheduleRekey(info.convId);
   }
 
@@ -454,17 +522,20 @@ class WebDartClient {
           return;
       }
       const myEpoch = this.adoptedEpochs.get(convId) || 0;
-      if (!myEpoch || decoded.epoch > myEpoch) {
+      const curKey = this.getCurrentKey(convId);
+      // Adopt on first join, on a newer epoch, or on an equal epoch with a
+      // DIFFERENT key (a restarted creator re-uses epoch 1 with a fresh key).
+      if (!myEpoch || decoded.epoch > myEpoch ||
+          (decoded.epoch === myEpoch && curKey && !curKey.equals(decoded.groupKey))) {
           this.adoptKey(convId, decoded.epoch, decoded.groupKey);
       }
   }
 
   private adoptKey(convId: number, epoch: number, key: Buffer) {
       const isNew = !this.adoptedEpochs.get(convId);
-      if (!roomKeys.has(convId)) roomKeys.set(convId, new Map());
-      roomKeys.get(convId)!.set(epoch, key);
-      convKeys.set(convId, key);
-      currentEpochs.set(convId, epoch);
+      if (!this.roomKeys.has(convId)) this.roomKeys.set(convId, new Map());
+      this.roomKeys.get(convId)!.set(epoch, key);
+      this.currentEpochs.set(convId, epoch);
       this.adoptedEpochs.set(convId, epoch);
       this.sharedWith.set(convId, new Set());
       // Start a fresh per-sender ratchet chain for this epoch and share it.
@@ -484,9 +555,9 @@ class WebDartClient {
   }
 
   private shareWithNewMembers(convId: number) {
-      const key = convKeys.get(convId);
+      const key = this.getCurrentKey(convId);
       if (!key) return;
-      const epoch = currentEpochs.get(convId) || 1;
+      const epoch = this.currentEpochs.get(convId) || 1;
       const roster = this.roster.get(convId);
       if (!roster) return;
       const done = this.sharedWith.get(convId) || new Set<number>();
@@ -524,7 +595,7 @@ class WebDartClient {
 
   private rekey(convId: number) {
       if (!this.isCreator.get(convId)) return;
-      const current = currentEpochs.get(convId) || 1;
+      const current = this.currentEpochs.get(convId) || 1;
       this.adoptKey(convId, current + 1, crypto.randomBytes(32));
       this.pruneOldEpochs(convId);
   }
@@ -545,6 +616,8 @@ class WebDartClient {
   private initOwnChain(convId: number, epoch: number) {
       const seed = crypto.randomBytes(32);
       this.setChain(convId, epoch, this.senderId, { key: seed, index: 0 });
+      if (!this.chainSeeds.has(convId)) this.chainSeeds.set(convId, new Map());
+      this.chainSeeds.get(convId)!.set(epoch, { key: seed, index: 0 });
       this.chainSharedWith.set(convId, new Set());
       this.shareChainWithMembers(convId, epoch);
   }
@@ -617,8 +690,8 @@ class WebDartClient {
   }
 
   private pruneOldEpochs(convId: number) {
-      const current = currentEpochs.get(convId) || 0;
-      const keys = roomKeys.get(convId);
+      const current = this.currentEpochs.get(convId) || 0;
+      const keys = this.roomKeys.get(convId);
       if (!keys) return;
       for (const [epoch] of keys) {
           if (epoch + 4 < current) keys.delete(epoch);
@@ -730,35 +803,39 @@ class WebDartClient {
   
   private sendDictReset(convId: number, targetId: number) {
       const reset = { type: 0x06, convId, senderId: this.senderId, targetId };
-      const buf = Codec.encodeDictReset(reset);
+      const convKey = this.getCurrentKey(convId);
       const serverPub = this.serverPubKeys.get(convId);
-      if (!serverPub) return;
+      if (!convKey || !serverPub) return;
+      const buf = Codec.encodeDictReset(reset, convKey);
       this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
   }
   
   private sendAck(convId: number, targetId: number, seq: number) {
       const ack = { type: TYPE_ACK, convId, senderId: this.senderId, targetId, seq };
-      const buf = Codec.encodeAck(ack);
+      const convKey = this.getCurrentKey(convId);
       const peerPub = this.roster.get(convId)?.get(targetId);
-      if (!peerPub) return;
+      if (!convKey || !peerPub) return;
+      const buf = Codec.encodeAck(ack, convKey);
       this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
   }
   
   private sendNack(convId: number, targetId: number, missingSeq: number[]) {
     this.stats.nacksSent++;
     const nack: NackDart = { type: TYPE_NACK, convId, senderId: this.senderId, targetId, missingSeq };
-    const buf = Codec.encodeNack(nack);
+    const convKey = this.getCurrentKey(convId);
     const peerPub = this.roster.get(convId)?.get(targetId);
-    if (!peerPub) return;
+    if (!convKey || !peerPub) return;
+    const buf = Codec.encodeNack(nack, convKey);
     this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
   }
   
   private sendSync(convId: number) {
       if (this.highestSentSeq === 0) return;
       const sync: SyncDart = { type: TYPE_SYNC, convId, senderId: this.senderId, highestSeq: this.highestSentSeq };
-      const buf = Codec.encodeSync(sync);
+      const convKey = this.getCurrentKey(convId);
       const serverPub = this.serverPubKeys.get(convId);
-      if (!serverPub) return;
+      if (!convKey || !serverPub) return;
+      const buf = Codec.encodeSync(sync, convKey);
       this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
   }
   

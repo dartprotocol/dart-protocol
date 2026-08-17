@@ -7,7 +7,7 @@
     <meta name="description" content="The thinking behind the Dart Protocol: how Wall Street's UDP broadcast architecture meets server-blind, per-message-ratcheted end-to-end encryption for chat.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -41,7 +41,7 @@
         <header class="page-hero">
             <h1>Why <span class="text-gradient">Dart?</span></h1>
             <p class="lead">
-                How we applied Wall Street architecture to consumer chat, creating an entirely unprecedented protocol.
+                How we applied a market-data style NACK + RAM-cache design to group chat.
             </p>
         </header>
 
@@ -56,9 +56,9 @@
                 back their state with heavy database reads and writes. The Dart Protocol asks a different question:
                 <strong>what if a chat app was built like a High-Frequency Trading (HFT) engine?</strong>
             </p>
-            <div class="callout" style="text-align: center; font-style: italic;">
-                "There is currently no mainstream chat system in the world that uses Dart's exact architectural combination for
-                text messaging. We crossed domains to build something radically unique."
+            <div class="callout">
+                "Mainstream chat is built on TCP and per-packet ACKs. Dart borrows the gap-detection / replay-cache model used
+                by financial multicast feeds and applies it to a small, server-blind encrypted room."
             </div>
         </section>
 

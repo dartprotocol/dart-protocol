@@ -8,15 +8,45 @@ import (
 	"errors"
 )
 
+func nackPrefixLen(missingCount int) int {
+	return 21 + missingCount*3
+}
+
+// ParseNack reads the cleartext gap list. A blind relay uses this to repair
+// from cache without holding the group key.
+func ParseNack(buf []byte) (*NackDart, error) {
+	if len(buf) < 21 {
+		return nil, errors.New("buffer too short")
+	}
+	count := int(binary.BigEndian.Uint16(buf[19:21]))
+	headerLen := nackPrefixLen(count)
+	if len(buf) < headerLen {
+		return nil, errors.New("buffer too short")
+	}
+	seqs := make([]uint32, 0, count)
+	for i := 0; i < count; i++ {
+		off := 21 + i*3
+		seqs = append(seqs, readUint24(buf[off:off+3]))
+	}
+	return &NackDart{
+		Type:       buf[0],
+		ConvId:     binary.BigEndian.Uint16(buf[1:3]),
+		SenderId:   binary.BigEndian.Uint16(buf[3:5]),
+		TargetId:   binary.BigEndian.Uint16(buf[5:7]),
+		MissingSeq: seqs,
+	}, nil
+}
+
 func (c *Codec) EncodeNack(nack *NackDart, nonce []byte) ([]byte, error) {
 	convKey, err := c.getConvKey(nack.ConvId)
 	if err != nil {
 		return nil, err
 	}
 
-	// 19-byte cleartext header: type(1) | convId(2) | senderId(2) | targetId(2)
-	// | nonce(12). senderId is the member who detected the gap (the signer);
-	// targetId is the member whose stream has the gap.
+	// Cleartext prefix: type(1) | convId(2) | senderId(2) | targetId(2)
+	// | nonce(12) | count(2) | seqs(3*count). GCM authenticates empty
+	// plaintext; the whole prefix is AAD so a blind server can still read
+	// the gap list.
 	if nonce == nil {
 		nonce = make([]byte, 12)
 		if _, err := rand.Read(nonce); err != nil {
@@ -24,19 +54,16 @@ func (c *Codec) EncodeNack(nack *NackDart, nonce []byte) ([]byte, error) {
 		}
 	}
 
-	header := make([]byte, 19)
+	headerLen := nackPrefixLen(len(nack.MissingSeq))
+	header := make([]byte, headerLen)
 	header[0] = nack.Type
 	binary.BigEndian.PutUint16(header[1:3], nack.ConvId)
 	binary.BigEndian.PutUint16(header[3:5], nack.SenderId)
 	binary.BigEndian.PutUint16(header[5:7], nack.TargetId)
-	copy(header[7:], nonce)
-
-	payload := make([]byte, 2+len(nack.MissingSeq)*3)
-	binary.BigEndian.PutUint16(payload[0:2], uint16(len(nack.MissingSeq)))
-	offset := 2
-	for _, seq := range nack.MissingSeq {
-		writeUint24(payload[offset:offset+3], seq)
-		offset += 3
+	copy(header[7:19], nonce)
+	binary.BigEndian.PutUint16(header[19:21], uint16(len(nack.MissingSeq)))
+	for i, seq := range nack.MissingSeq {
+		writeUint24(header[21+i*3:24+i*3], seq)
 	}
 
 	block, err := aes.NewCipher(convKey)
@@ -48,7 +75,7 @@ func (c *Codec) EncodeNack(nack *NackDart, nonce []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	ciphertext := aesgcm.Seal(nil, nonce, payload, header)
+	ciphertext := aesgcm.Seal(nil, nonce, nil, header)
 	res := make([]byte, len(header)+len(ciphertext))
 	copy(res, header)
 	copy(res[len(header):], ciphertext)
@@ -56,18 +83,19 @@ func (c *Codec) EncodeNack(nack *NackDart, nonce []byte) ([]byte, error) {
 }
 
 func (c *Codec) DecodeNack(buf []byte) (*NackDart, error) {
-	if len(buf) < 19 {
+	nack, err := ParseNack(buf)
+	if err != nil {
+		return nil, err
+	}
+	headerLen := nackPrefixLen(len(nack.MissingSeq))
+	if len(buf) < headerLen+16 {
 		return nil, errors.New("buffer too short")
 	}
-	typ := buf[0]
-	convId := binary.BigEndian.Uint16(buf[1:3])
-	senderId := binary.BigEndian.Uint16(buf[3:5])
-	targetId := binary.BigEndian.Uint16(buf[5:7])
-	header := buf[:19]
-	nonce := buf[7:19]
-	encrypted := buf[19:]
+	header := buf[:headerLen]
+	nonce := header[7:19]
+	tag := buf[headerLen:]
 
-	convKey, err := c.getConvKey(convId)
+	convKey, err := c.getConvKey(nack.ConvId)
 	if err != nil {
 		return nil, err
 	}
@@ -81,32 +109,10 @@ func (c *Codec) DecodeNack(buf []byte) (*NackDart, error) {
 		return nil, err
 	}
 
-	payload, err := aesgcm.Open(nil, nonce, encrypted, header)
-	if err != nil {
+	if _, err := aesgcm.Open(nil, nonce, tag, header); err != nil {
 		return nil, err
 	}
-
-	if len(payload) < 2 {
-		return nil, errors.New("invalid nack payload")
-	}
-	count := binary.BigEndian.Uint16(payload[0:2])
-	var seqs []uint32
-	offset := 2
-	for i := 0; i < int(count); i++ {
-		if len(payload) < offset+3 {
-			break
-		}
-		seqs = append(seqs, readUint24(payload[offset:offset+3]))
-		offset += 3
-	}
-
-	return &NackDart{
-		Type:       typ,
-		ConvId:     convId,
-		SenderId:   senderId,
-		TargetId:   targetId,
-		MissingSeq: seqs,
-	}, nil
+	return nack, nil
 }
 
 func (c *Codec) EncodeSync(sync *SyncDart, nonce []byte) ([]byte, error) {

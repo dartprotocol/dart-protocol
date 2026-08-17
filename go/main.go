@@ -44,6 +44,7 @@ type NativeDartClient struct {
 	senderChains    map[uint16]map[uint16]map[uint16]core.ChainState
 	chainSharedWith map[uint16]map[uint16]bool
 	messageKeys     map[uint32]messageKeyEntry
+	chainSeeds      map[uint16]map[uint16]core.ChainState // convId -> epoch -> index-0 chain state
 
 	tcpConn     net.Conn
 	useFallback bool
@@ -63,6 +64,7 @@ type NativeDartClient struct {
 	receivedMessages map[uint16]map[uint32]*core.DataDart
 
 	syncTimers []*time.Timer
+	ackedSeq   map[uint16]uint32
 	ackTimers  map[uint16]*time.Timer
 
 	outOfOrderBuffer map[uint16]map[uint32][]byte
@@ -112,6 +114,8 @@ func NewNativeDartClient(serverIP string, port int) (*NativeDartClient, error) {
 		senderChains:    make(map[uint16]map[uint16]map[uint16]core.ChainState),
 		chainSharedWith: make(map[uint16]map[uint16]bool),
 		messageKeys:     make(map[uint32]messageKeyEntry),
+		ackedSeq:        make(map[uint16]uint32),
+		chainSeeds:      make(map[uint16]map[uint16]core.ChainState),
 	}, nil
 }
 
@@ -289,8 +293,19 @@ func (c *NativeDartClient) SendData(roomId uint16, payload string) {
 	fmt.Printf("\x1b[90m[↑] Sending Seq %d...\x1b[0m\r", seq)
 
 	c.clearSyncTimers()
-	c.syncTimers = append(c.syncTimers, time.AfterFunc(300*time.Millisecond, func() { c.sendSync(roomId) }))
-	c.syncTimers = append(c.syncTimers, time.AfterFunc(1000*time.Millisecond, func() { c.sendSync(roomId) }))
+	c.syncProbe(roomId)
+}
+
+// Re-arming sync probe: while the most recent message stays unacknowledged,
+// keep probing so SYNC-driven NACK repair retries under loss instead of
+// stalling until the next rekey.
+func (c *NativeDartClient) syncProbe(convId uint16) {
+	c.syncTimers = append(c.syncTimers, time.AfterFunc(300*time.Millisecond, func() {
+		c.sendSync(convId)
+		if core.SeqDelta(c.highestSentSeq, c.ackedSeq[convId]) >= core.SeqMod/2 {
+			c.syncProbe(convId)
+		}
+	}))
 }
 
 func (c *NativeDartClient) sendSync(convId uint16) {
@@ -384,6 +399,24 @@ func (c *NativeDartClient) JoinRoom(roomId uint16) {
 	buf, _ := c.codec.EncodeKeyReq(req)
 	c.send(buf)
 	c.mu.Unlock()
+
+	// Retry: each KeyReq makes the server re-notify the roster, which is how
+	// members refresh stale pubkeys (MEMBER_INFO has no other retry). Without
+	// this, a member that lost the roster update can never verify another
+	// member's NACKs or decode their shares again.
+	for _, delay := range []time.Duration{1000, 2000, 3000} {
+		delay := delay
+		time.AfterFunc(delay*time.Millisecond, func() {
+			rn := make([]byte, 16)
+			cryptorand.Read(rn)
+			retryReq := *req
+			retryReq.ReqNonce = rn
+			c.mu.Lock()
+			out, _ := c.codec.EncodeKeyReq(&retryReq)
+			c.send(out)
+			c.mu.Unlock()
+		})
+	}
 
 	fmt.Printf("\x1b[36m[SYSTEM] Joining room %d (My ID: %d)...\x1b[0m\n", roomId, c.senderId)
 	fmt.Printf("\x1b[36m[SYSTEM] Performing ECDH Key Exchange...\x1b[0m\n")
@@ -509,6 +542,10 @@ func (c *NativeDartClient) initOwnChain(convId uint16, epoch uint16) {
 	seed := make([]byte, 32)
 	cryptorand.Read(seed)
 	c.setChain(convId, epoch, c.senderId, core.ChainState{Key: seed, Index: 0})
+	if c.chainSeeds[convId] == nil {
+		c.chainSeeds[convId] = make(map[uint16]core.ChainState)
+	}
+	c.chainSeeds[convId][epoch] = core.ChainState{Key: seed, Index: 0}
 	c.chainSharedWith[convId] = make(map[uint16]bool)
 	c.shareChainWithMembers(convId, epoch)
 }
@@ -914,6 +951,14 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 				}
 			}
 		}
+		// The NACKer likely missed the chain share too (it can't decrypt my
+		// stream without one). Re-share the chain SEED (index 0) so it can
+		// reach back and decrypt the whole epoch, not just future messages.
+		if epoch := c.codec.CurrentEpochs[nackConvId]; epoch != 0 {
+			if seed, ok := c.chainSeeds[nackConvId][epoch]; ok {
+				c.sendChainShare(nackConvId, epoch, nackSenderId, seed.Key, seed.Index)
+			}
+		}
 
 	case core.TypeSync:
 		// SYNC is keyed to the relay server, which verified and relayed it.
@@ -988,7 +1033,9 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 		}
 		ack, err := c.codec.DecodeAck(ackStripped)
 		if err == nil && core.SeqDelta(c.highestSentSeq, ack.Seq) < core.SeqMod/2 {
-			c.clearSyncTimers()
+			// Record the ACK; the re-arming sync probe stops on its own once
+			// the latest message is acknowledged.
+			c.ackedSeq[ack.ConvId] = ack.Seq
 			fmt.Printf("\x1b[90m[✓] Delivered (Seq %d)                                  \x1b[0m\n", ack.Seq)
 		}
 
@@ -1018,7 +1065,11 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			return
 		}
 		currentEpoch := c.codec.CurrentEpochs[convId]
-		if _, has := c.codec.ConvKeys[convId]; !has || epoch > currentEpoch {
+		_, has := c.codec.ConvKeys[convId]
+		curKey := c.codec.ConvKeys[convId]
+		// Adopt on first join, on a newer epoch, or on an equal epoch with a
+		// DIFFERENT key (a restarted creator re-uses epoch 1 with a fresh key).
+		if !has || epoch > currentEpoch || (epoch == currentEpoch && !bytes.Equal(curKey, groupKey)) {
 			c.adoptKey(convId, epoch, groupKey)
 		}
 
@@ -1050,7 +1101,19 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 		for _, m := range info.Members {
 			roster[m.SenderId] = m.PubKey
 		}
+		prevRoster, hadRoster := c.roster[info.ConvId]
 		c.roster[info.ConvId] = roster
+		if hadRoster {
+			// A member whose pubkey changed (reconnect with a fresh ECDH
+			// keypair) needs fresh group-key and chain shares under the new
+			// key; drop the shared-with flags so the shares are re-sent.
+			for sid, pub := range roster {
+				if prevPub, ok := prevRoster[sid]; ok && !bytes.Equal(prevPub, pub) {
+					delete(c.sharedWith[info.ConvId], sid)
+					delete(c.chainSharedWith[info.ConvId], sid)
+				}
+			}
+		}
 		c.serverPubKeys[info.ConvId] = serverPub
 		prevCreator := c.isCreator[info.ConvId]
 		c.isCreator[info.ConvId] = info.Creator

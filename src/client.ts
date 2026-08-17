@@ -1,6 +1,6 @@
 import * as dgram from 'dgram';
 import * as crypto from 'crypto';
-import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_CHAIN_SHARE, DICT_WINDOW, dictFingerprint, roomKeys, currentEpochs, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, ChainShareDart, DecryptedData, ChainState, convKeys, seqDelta, seqNext, SEQ_MOD, advanceChain, pairwiseKey, signControlFrame, verifyControlFrame, stripControlFrame } from './core';
+import { Codec, TYPE_DATA, TYPE_NACK, TYPE_SYNC, TYPE_KEY_REQ, TYPE_KEY_SHARE, TYPE_MEMBER_INFO, TYPE_CHAIN_SHARE, TYPE_ACK, DICT_WINDOW, dictFingerprint, DataDart, NackDart, SyncDart, KeyReqDart, KeyShareDart, ChainShareDart, DecryptedData, ChainState, seqDelta, seqNext, SEQ_MOD, advanceChain, pairwiseKey, signControlFrame, verifyControlFrame, stripControlFrame } from './core';
 
 export class DartClient {
   public socket: dgram.Socket;
@@ -22,7 +22,11 @@ export class DartClient {
   public stats = { packetsSent: 0, packetsReceived: 0, bytesSent: 0, bytesReceived: 0, nacksSent: 0, nacksReceived: 0, retransmits: 0, syncsSent: 0 };
   
   private probeTimer: NodeJS.Timeout | null = null;
+  private ackedSeq = new Map<number, number>(); // convId -> highest acked seq
+  private seenSeq = new Map<number, number>(); // senderId -> highest seq seen (any packet)
+  private nackRetryTimers = new Map<number, NodeJS.Timeout>(); // senderId -> retry timer
   private optimisticTimers = new Map<number, NodeJS.Timeout>();
+  private ackTimers = new Map<number, NodeJS.Timeout>();
   
   private tcpSocket?: any; // require('net').Socket
   public useFallback = false;
@@ -48,9 +52,29 @@ export class DartClient {
   private chainSharedWith = new Map<number, Set<number>>();
   // Cached per-message keys (and their chain index) by seq, for retransmission.
   private messageKeys = new Map<number, { key: Buffer; idx: number }>();
-  // The epoch this client has adopted (per-client, unlike the shared codec
-  // globals) so each member creates its own ratchet chain.
+  // Initial chain state (index 0) per epoch, so a receiver that lost the
+  // chain share can be given a state that reaches back to the epoch start.
+  private chainSeeds = new Map<number, Map<number, ChainState>>();
+  // The epoch this client has adopted so each member creates its own ratchet chain.
   private adoptedEpochs = new Map<number, number>();
+
+  // Per-client group-key state. Must not be shared across in-process clients
+  // (a module-level map would leak keys between test peers).
+  private roomKeys = new Map<number, Map<number, Buffer>>();
+  private currentEpochs = new Map<number, number>();
+  private closed = false;
+
+  getCurrentKey(convId: number): Buffer | undefined {
+    return this.roomKeys.get(convId)?.get(this.currentEpochs.get(convId) || 1);
+  }
+
+  currentEpoch(convId: number): number {
+    return this.currentEpochs.get(convId) || 0;
+  }
+
+  hasJoined(convId: number): boolean {
+    return !!this.getCurrentKey(convId) && this.roster.has(convId);
+  }
 
   setServerFingerprint(fp: string) {
     this.serverFingerprint = fp.trim().toLowerCase();
@@ -88,6 +112,13 @@ export class DartClient {
       clientPubKey: this.clientECDH.getPublicKey()
     };
     this.broadcast(Codec.encodeKeyReq(req));
+    // Retry: each KeyReq makes the server re-notify the roster, which is how
+    // members refresh stale pubkeys (MEMBER_INFO has no other retry). Without
+    // this, a member that lost the roster update can never verify another
+    // member's NACKs or decode their shares again.
+    setTimeout(() => this.broadcast(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })), 1000);
+    setTimeout(() => this.broadcast(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })), 2000);
+    setTimeout(() => this.broadcast(Codec.encodeKeyReq({ ...req, reqNonce: crypto.randomBytes(16) })), 3000);
   }
 
   private handleMemberInfo(buf: Buffer) {
@@ -110,7 +141,22 @@ export class DartClient {
     }
     const rosterMap = new Map<number, Buffer>();
     for (const m of info.members) rosterMap.set(m.senderId, m.pubKey);
+    const prevRoster = this.roster.get(info.convId);
     this.roster.set(info.convId, rosterMap);
+    if (prevRoster) {
+      // A member whose pubkey changed (reconnect with a fresh ECDH keypair)
+      // needs fresh group-key and chain shares under the new key; drop the
+      // shared-with flags so the shares are re-sent.
+      const keyDone = this.sharedWith.get(info.convId);
+      const chainDone = this.chainSharedWith.get(info.convId);
+      for (const [mId, pub] of rosterMap) {
+        const prev = prevRoster.get(mId);
+        if (prev && !prev.equals(pub)) {
+          keyDone?.delete(mId);
+          chainDone?.delete(mId);
+        }
+      }
+    }
     this.serverPubKeys.set(info.convId, serverPubKey);
     const prevCreator = this.isCreator.get(info.convId) || false;
     this.isCreator.set(info.convId, info.creator);
@@ -127,7 +173,7 @@ export class DartClient {
     }
     // Share my ratchet chain with any members that just joined (so they can
     // decrypt my future messages).
-    this.shareChainWithMembers(info.convId, currentEpochs.get(info.convId) || 1);
+    this.shareChainWithMembers(info.convId, this.currentEpochs.get(info.convId) || 1);
     this.scheduleRekey(info.convId);
   }
 
@@ -147,16 +193,20 @@ export class DartClient {
       return;
     }
     const myEpoch = this.adoptedEpochs.get(convId) || 0;
-    if (!myEpoch || decoded.epoch > myEpoch) {
+    const curKey = this.getCurrentKey(convId);
+    // Adopt on first join, on a newer epoch, or on an equal epoch with a
+    // DIFFERENT key (a restarted creator re-uses epoch 1 with a fresh key and
+    // members must switch, or they keep encrypting controls with a dead key).
+    if (!myEpoch || decoded.epoch > myEpoch ||
+        (decoded.epoch === myEpoch && curKey && !curKey.equals(decoded.groupKey))) {
       this.adoptKey(convId, decoded.epoch, decoded.groupKey);
     }
   }
 
   private adoptKey(convId: number, epoch: number, key: Buffer) {
-    if (!roomKeys.has(convId)) roomKeys.set(convId, new Map());
-    roomKeys.get(convId)!.set(epoch, key);
-    convKeys.set(convId, key);
-    currentEpochs.set(convId, epoch);
+    if (!this.roomKeys.has(convId)) this.roomKeys.set(convId, new Map());
+    this.roomKeys.get(convId)!.set(epoch, key);
+    this.currentEpochs.set(convId, epoch);
     this.adoptedEpochs.set(convId, epoch);
     this.sharedWith.set(convId, new Set());
     this.shareWithNewMembers(convId);
@@ -184,6 +234,8 @@ export class DartClient {
   private initOwnChain(convId: number, epoch: number) {
     const seed = crypto.randomBytes(32);
     this.setChain(convId, epoch, this.senderId, { key: seed, index: 0 });
+    if (!this.chainSeeds.has(convId)) this.chainSeeds.set(convId, new Map());
+    this.chainSeeds.get(convId)!.set(epoch, { key: seed, index: 0 });
     this.chainSharedWith.set(convId, new Set());
     this.shareChainWithMembers(convId, epoch);
   }
@@ -253,9 +305,9 @@ export class DartClient {
   }
 
   private shareWithNewMembers(convId: number) {
-    const key = convKeys.get(convId);
+    const key = this.getCurrentKey(convId);
     if (!key) return;
-    const epoch = currentEpochs.get(convId) || 1;
+    const epoch = this.currentEpochs.get(convId) || 1;
     const roster = this.roster.get(convId);
     if (!roster) return;
     const done = this.sharedWith.get(convId) || new Set<number>();
@@ -293,7 +345,7 @@ export class DartClient {
 
   private rekey(convId: number) {
     if (!this.isCreator.get(convId)) return;
-    const current = currentEpochs.get(convId) || 1;
+    const current = this.currentEpochs.get(convId) || 1;
     this.adoptKey(convId, current + 1, crypto.randomBytes(32));
     this.pruneOldEpochs(convId);
   }
@@ -305,11 +357,14 @@ export class DartClient {
   }
 
   private pruneOldEpochs(convId: number) {
-    const current = currentEpochs.get(convId) || 0;
-    const keys = roomKeys.get(convId);
+    const current = this.currentEpochs.get(convId) || 0;
+    const keys = this.roomKeys.get(convId);
     if (!keys) return;
     for (const [epoch] of keys) {
-      if (epoch + 4 < current) keys.delete(epoch);
+      if (epoch + 4 < current) {
+        keys.delete(epoch);
+        this.chainSeeds.get(convId)?.delete(epoch);
+      }
     }
   }
   
@@ -381,7 +436,7 @@ export class DartClient {
     const dict = this.getDictionary(this.senderId, seq);
     
     // Derive the per-message key from my ratchet chain and advance it.
-    const epoch = currentEpochs.get(convId) || 1;
+    const epoch = this.currentEpochs.get(convId) || 1;
     const myChain = this.getChain(convId, epoch, this.senderId);
     if (!myChain) return; // key exchange not complete yet
     const idx = myChain.index;
@@ -395,14 +450,11 @@ export class DartClient {
     this.pruneSent();
     this.messageStatus.set(seq, 'sent');
     
-    const buf = Codec.encodeDataHelper(dart, dict, messageKey, idx);
+    const buf = Codec.encodeDataHelper(dart, dict, messageKey, idx, epoch);
     this.broadcast(buf);
     
     // Restart probe timer
-    if (this.probeTimer) clearTimeout(this.probeTimer);
-    this.probeTimer = setTimeout(() => {
-        this.sendSync(convId);
-    }, 400); // Send sync if no new messages sent for 400ms
+    this.scheduleProbe(convId);
 
     // Optimistic delivery timer
     const t = setTimeout(() => {
@@ -411,7 +463,22 @@ export class DartClient {
     this.optimisticTimers.set(seq, t);
   }
 
+  private scheduleProbe(convId: number) {
+    if (this.probeTimer) clearTimeout(this.probeTimer);
+    this.probeTimer = setTimeout(() => {
+        this.sendSync(convId);
+        // Re-arm while the most recent message is still unacknowledged, so
+        // SYNC-driven NACK repair keeps retrying under loss instead of
+        // stalling silently until the next rekey.
+        const acked = this.ackedSeq.get(convId) || 0;
+        if (seqDelta(this.highestSentSeq, acked) >= SEQ_MOD / 2) {
+          this.scheduleProbe(convId);
+        }
+    }, 400); // Send sync if no new messages sent for 400ms
+  }
+
   private broadcast(buf: Buffer) {
+    if (this.closed) return;
     this.stats.packetsSent++;
     this.stats.bytesSent += buf.length;
     if (this.useFallback && this.tcpSocket) {
@@ -425,7 +492,6 @@ export class DartClient {
         }
     }
   }
-
   private handleMessage(buf: Buffer, rinfo: dgram.RemoteInfo) {
     try {
       const type = buf.readUInt8(0);
@@ -439,6 +505,12 @@ export class DartClient {
         
         const hasBaseline = this.highestReceivedSeq.has(parsedSenderId);
         const highestReceived = this.highestReceivedSeq.get(parsedSenderId) || 0;
+        const seen = this.seenSeq.get(parsedSenderId) || 0;
+        if (seqDelta(seen, seq) > 0 && seqDelta(seen, seq) < SEQ_MOD / 2) {
+          this.seenSeq.set(parsedSenderId, seq);
+        } else if (!this.seenSeq.has(parsedSenderId)) {
+          this.seenSeq.set(parsedSenderId, seq);
+        }
         // Modular gap test: ahead is how many steps `seq` is beyond the highest
         // we've seen. 0 = duplicate, >= SEQ_MOD/2 = stale, 1 = exact next.
         // A receiver with no baseline yet treats the first packet as its
@@ -461,6 +533,7 @@ export class DartClient {
           }
           if (missing.length > 0) {
             this.sendNack(convId, parsedSenderId, missing);
+            this.scheduleNackRetry(convId, parsedSenderId);
           }
           return; // buffered, not processed yet
         }
@@ -485,14 +558,16 @@ export class DartClient {
         const nackPeerPub = this.roster.get(nackConvId)?.get(nackSenderId);
         const nackStripped = nackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, nackPeerPub)) : null;
         if (!nackStripped) return;
-        const nack = Codec.decodeNack(nackStripped);
+        const convKey = this.getCurrentKey(nackConvId);
+        if (!convKey) return;
+        const nack = Codec.decodeNack(nackStripped, convKey);
         for (const seq of nack.missingSeq) {
           const dart = this.sentMessages.get(seq);
           const mk = this.messageKeys.get(seq);
           if (dart && mk) {
             this.stats.retransmits++;
             const dict = this.getDictionary(this.senderId, seq);
-            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx);
+            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, this.currentEpochs.get(dart.convId) || 1);
             this.broadcast(outBuf);
             
             // Reset optimistic timer
@@ -506,6 +581,14 @@ export class DartClient {
             this.optimisticTimers.set(seq, t);
           }
         }
+        // The NACKer likely missed the chain share too (it can't decrypt my
+        // stream without one). Re-share the chain SEED (index 0) so it can
+        // reach back and decrypt the whole epoch, not just future messages.
+        const epoch = this.currentEpochs.get(nackConvId) || 1;
+        const seed = this.chainSeeds.get(nackConvId)?.get(epoch);
+        if (seed) {
+          this.sendChainShare(nackConvId, epoch, nackSenderId, seed.key, seed.index);
+        }
       } else if (type === TYPE_KEY_SHARE) {
         this.handleKeyShare(buf);
       } else if (type === TYPE_MEMBER_INFO) {
@@ -514,7 +597,15 @@ export class DartClient {
         // SYNC is keyed to the relay server, which verified and relayed it.
         const syncStripped = stripControlFrame(buf);
         if (!syncStripped) return;
-        const sync = Codec.decodeSync(syncStripped);
+        const syncKey = this.getCurrentKey(syncStripped.readUInt16BE(1));
+        if (!syncKey) return;
+        const sync = Codec.decodeSync(syncStripped, syncKey);
+        const seen = this.seenSeq.get(sync.senderId) || 0;
+        if (seqDelta(seen, sync.highestSeq) > 0 && seqDelta(seen, sync.highestSeq) < SEQ_MOD / 2) {
+          this.seenSeq.set(sync.senderId, sync.highestSeq);
+        } else if (!this.seenSeq.has(sync.senderId)) {
+          this.seenSeq.set(sync.senderId, sync.highestSeq);
+        }
         const hasBaseline = this.highestReceivedSeq.has(sync.senderId);
         const highestReceived = this.highestReceivedSeq.get(sync.senderId) || 0;
         // Fresh receiver: NACK the whole reported range; otherwise only the
@@ -529,13 +620,16 @@ export class DartClient {
             }
             if (missing.length > 0) {
                 this.sendNack(sync.convId, sync.senderId, missing);
+                this.scheduleNackRetry(sync.convId, sync.senderId);
             }
         }
       } else if (type === 0x06) {
         // Dict-Reset is keyed to the relay server, which verified it.
         const resetStripped = stripControlFrame(buf);
         if (!resetStripped) return;
-        const reset = Codec.decodeDictReset(resetStripped);
+        const resetKey = this.getCurrentKey(resetStripped.readUInt16BE(1));
+        if (!resetKey) return;
+        const reset = Codec.decodeDictReset(resetStripped, resetKey);
         if (reset.targetId === this.senderId) {
           this.sentMessages.clear(); // I'm the target: flush my history
         } else if (this.receivedMessages.has(reset.targetId)) {
@@ -549,9 +643,11 @@ export class DartClient {
         const ackPeerPub = this.roster.get(ackConvId)?.get(ackSenderId);
         const ackStripped = ackPeerPub ? verifyControlFrame(buf, pairwiseKey(this.clientECDH, ackPeerPub)) : null;
         if (!ackStripped) return;
-        const ack = Codec.decodeAck(ackStripped);
+        const ackKey = this.getCurrentKey(ackConvId);
+        if (!ackKey) return;
+        const ack = Codec.decodeAck(ackStripped, ackKey);
         if (seqDelta(this.highestSentSeq, ack.seq) < SEQ_MOD / 2) {
-          if (this.probeTimer) clearTimeout(this.probeTimer);
+          this.ackedSeq.set(ackConvId, ack.seq);
         }
       }
     } catch (e) {
@@ -605,6 +701,10 @@ export class DartClient {
         this.highestReceivedSeq.set(dart.senderId, dart.seq);
       }
       this.pruneReceived(dart.senderId);
+      if (this.ackTimers.has(parsedSenderId)) clearTimeout(this.ackTimers.get(parsedSenderId)!);
+      this.ackTimers.set(parsedSenderId, setTimeout(() => {
+        this.sendAck(dec.convId, parsedSenderId, seq);
+      }, 200));
     }
   }
 
@@ -629,35 +729,76 @@ export class DartClient {
 
   private sendDictReset(convId: number, targetId: number) {
     const reset = { type: 0x06, convId, senderId: this.senderId, targetId };
-    const buf = Codec.encodeDictReset(reset);
+    const convKey = this.getCurrentKey(convId);
     const serverPub = this.serverPubKeys.get(convId);
-    if (!serverPub) return;
+    if (!convKey || !serverPub) return;
+    const buf = Codec.encodeDictReset(reset, convKey);
     this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
+  }
+
+  private sendAck(convId: number, targetId: number, seq: number) {
+    const ack = { type: TYPE_ACK, convId, senderId: this.senderId, targetId, seq };
+    const convKey = this.getCurrentKey(convId);
+    const peerPub = this.roster.get(convId)?.get(targetId);
+    if (!convKey || !peerPub) return;
+    const buf = Codec.encodeAck(ack, convKey);
+    this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
   }
   
   private sendNack(convId: number, targetId: number, missingSeq: number[]) {
     this.stats.nacksSent++;
     const nack: NackDart = { type: TYPE_NACK, convId, senderId: this.senderId, targetId, missingSeq };
-    const buf = Codec.encodeNack(nack);
+    const convKey = this.getCurrentKey(convId);
     const peerPub = this.roster.get(convId)?.get(targetId);
-    if (!peerPub) return;
+    if (!convKey || !peerPub) return;
+    const buf = Codec.encodeNack(nack, convKey);
     this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, peerPub)));
+  }
+
+  // Re-NACK the outstanding gap on a timer while it persists. A NACK is only
+  // sent on incoming packets, so without this a single lost repair round would
+  // stall recovery forever (no further packets, no further NACKs).
+  private scheduleNackRetry(convId: number, senderId: number) {
+    if (this.nackRetryTimers.has(senderId)) return;
+    const t = setTimeout(() => {
+      this.nackRetryTimers.delete(senderId);
+      const seen = this.seenSeq.get(senderId);
+      const hasBaseline = this.highestReceivedSeq.has(senderId);
+      const highest = this.highestReceivedSeq.get(senderId) || 0;
+      if (!hasBaseline || seen === undefined) return;
+      const missing: number[] = [];
+      const ahead = seqDelta(highest, seen);
+      for (let k = 1; k < ahead && k <= DICT_WINDOW; k++) {
+        const i = (highest + k) & 0xFFFFFF;
+        if (!this.outOfOrderBuffer.get(senderId)?.has(i) && !this.receivedMessages.get(senderId)?.has(i)) {
+          missing.push(i);
+        }
+      }
+      if (missing.length > 0) {
+        this.sendNack(convId, senderId, missing);
+        this.scheduleNackRetry(convId, senderId);
+      }
+    }, 800);
+    this.nackRetryTimers.set(senderId, t);
   }
   
   private sendSync(convId: number) {
       if (this.highestSentSeq === 0) return;
       this.stats.syncsSent++;
       const sync: SyncDart = { type: TYPE_SYNC, convId, senderId: this.senderId, highestSeq: this.highestSentSeq };
-      const buf = Codec.encodeSync(sync);
+      const convKey = this.getCurrentKey(convId);
       const serverPub = this.serverPubKeys.get(convId);
-      if (!serverPub) return;
+      if (!convKey || !serverPub) return;
+      const buf = Codec.encodeSync(sync, convKey);
       this.broadcast(signControlFrame(buf, pairwiseKey(this.clientECDH, serverPub)));
   }
   
   close() {
+    this.closed = true;
     if (this.probeTimer) clearTimeout(this.probeTimer);
     if (this.rekeyTimer) clearTimeout(this.rekeyTimer);
     for (const timer of this.optimisticTimers.values()) clearTimeout(timer);
+    for (const timer of this.ackTimers.values()) clearTimeout(timer);
     if (this.tcpSocket) {
         this.tcpSocket.destroy();
     }

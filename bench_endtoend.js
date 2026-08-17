@@ -4,7 +4,7 @@
 // (K-1) (ACKs) = (2K-1) packets, inflated by 1/(1-L) for link loss L.
 const { DartGroupServer } = require('/var/www/html/dart/src/server.js');
 const { DartClient } = require('/var/www/html/dart/src/client.js');
-const { Codec, convKeys } = require('/var/www/html/dart/src/core.js');
+const { Codec } = require('/var/www/html/dart/src/core.js');
 const { execFile } = require('child_process');
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -44,7 +44,7 @@ async function joinAll(clients) {
   for (const c of clients) c.joinConversation(1);
   for (let i = 0; i < 300; i++) {
     await delay(25);
-    if (clients.every((c) => convKeys.has(1) && c.roster.has(1))) break;
+    if (clients.every((c) => c.hasJoined(1))) break;
   }
   const joinMs = Date.now() - t0;
   const joinPkts = clients.reduce((a, c) => a + c.stats.packetsSent + c.stats.packetsReceived, 0);
@@ -124,7 +124,7 @@ async function scenario(label, kind, N, mode, M, m, spacing, loss) {
   await delay(300);
   const clients = await makeClients(server, N);
   const { joinMs, joinPkts } = await joinAll(clients);
-  const ok = clients.every((c) => convKeys.has(1) && c.roster.has(1));
+  const ok = clients.every((c) => c.hasJoined(1));
 
   if (loss > 0) {
     for (let i = 0; i < N; i++) clients[i].simulateLossPercent = loss;

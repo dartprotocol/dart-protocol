@@ -119,6 +119,10 @@ struct ClientState {
     chain_shared_with: HashMap<u16, HashSet<u16>>,
     // Cached per-message keys (and chain index) by seq, for retransmission.
     message_keys: HashMap<u32, (Vec<u8>, u32)>,
+    acked_seq: HashMap<u16, u32>,
+    // Index-0 chain state per epoch, so a receiver that lost the chain share
+    // can be given a state that reaches back to the epoch start.
+    chain_seeds: HashMap<u16, HashMap<u16, ChainState>>,
 
     pending_queue: Vec<String>,
     last_send_time: Instant,
@@ -147,6 +151,8 @@ impl ClientState {
             sender_chains: HashMap::new(),
             chain_shared_with: HashMap::new(),
             message_keys: HashMap::new(),
+            acked_seq: HashMap::new(),
+            chain_seeds: HashMap::new(),
             pending_queue: Vec::new(),
             last_send_time: Instant::now() - Duration::from_secs(10),
         }
@@ -335,6 +341,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let buf = st.codec.encode_key_req(&req);
             transport.send(&buf).await;
+            // Retry: each KeyReq makes the server re-notify the roster, which
+            // is how members refresh stale pubkeys (MEMBER_INFO has no other
+            // retry).
+            for delay_ms in [1000u64, 2000, 3000] {
+                let transport2 = transport.clone();
+                let mut retry_req = req.clone();
+                tokio::spawn(async move {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    retry_req.req_nonce = rand::random();
+                    let buf2 = Codec::new().encode_key_req(&retry_req);
+                    let _ = transport2.send(&buf2).await;
+                });
+            }
             println!("\x1b[36m[SYSTEM] Joining room {} (My ID: {})...\x1b[0m", room_id, st.sender_id);
             println!("\x1b[36m[SYSTEM] Performing ECDH Key Exchange...\x1b[0m");
         } else {
@@ -376,25 +395,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print!("\x1b[90m[↑] Sending Seq {}...\x1b[0m\r", seq);
                 io::stdout().flush().unwrap();
                 
-                // Sync timers
+                // Re-arming sync probe: while the most recent message stays
+                // unacknowledged, keep probing so SYNC-driven NACK repair
+                // retries under loss instead of stalling until the next rekey.
                 let state_clone1 = state.clone();
                 let transport_clone1 = transport.clone();
                 tokio::spawn(async move {
                     sleep(Duration::from_millis(300)).await;
-                    send_sync(state_clone1.clone(), transport_clone1.clone()).await;
-                });
-                
-                let state_clone2 = state.clone();
-                let transport_clone2 = transport.clone();
-                tokio::spawn(async move {
-                    sleep(Duration::from_millis(1000)).await;
-                    send_sync(state_clone2, transport_clone2).await;
+                    start_sync_probe(state_clone1, transport_clone1);
                 });
             }
         }
     }
 
     Ok(())
+}
+
+fn start_sync_probe(state: Arc<Mutex<ClientState>>, transport: Transport) {
+    tokio::spawn(async move {
+        loop {
+            let keep_going = {
+                let st = state.lock().await;
+                if st.highest_sent_seq == 0 {
+                    false
+                } else {
+                    // Keep probing while the latest message stays unacknowledged.
+                    seq_delta(st.highest_sent_seq, *st.acked_seq.get(&st.room_id).unwrap_or(&0)) >= SEQ_MOD / 2
+                }
+            };
+            send_sync(state.clone(), transport.clone()).await;
+            if !keep_going {
+                break;
+            }
+            sleep(Duration::from_millis(1000)).await;
+        }
+    });
 }
 
 async fn send_sync(state: Arc<Mutex<ClientState>>, transport: Transport) {
@@ -450,6 +485,23 @@ fn handle_member_info(
     for m in &info.members {
         roster.insert(m.sender_id, m.pub_key.clone());
     }
+    if let Some(prev) = st.roster.get(&info.conv_id) {
+        // A member whose pubkey changed (reconnect with a fresh ECDH keypair)
+        // needs fresh group-key and chain shares under the new key; drop the
+        // shared-with flags so the shares are re-sent.
+        for (sid, key) in &roster {
+            if let Some(prev_pub) = prev.get(sid) {
+                if prev_pub != key {
+                    if let Some(done) = st.shared_with.get_mut(&info.conv_id) {
+                        done.remove(sid);
+                    }
+                    if let Some(done) = st.chain_shared_with.get_mut(&info.conv_id) {
+                        done.remove(sid);
+                    }
+                }
+            }
+        }
+    }
     st.roster.insert(info.conv_id, roster);
     st.server_pub_key = Some(server_pub);
     let prev_creator = *st.is_creator.get(&info.conv_id).unwrap_or(&false);
@@ -503,7 +555,12 @@ fn handle_key_share(
         Err(_) => return None,
     };
     let current = *st.codec.current_epochs.get(&conv_id).unwrap_or(&0);
-    if !st.codec.conv_keys.contains_key(&conv_id) || epoch > current {
+    let cur_key = st.codec.conv_keys.get(&conv_id).cloned();
+    // Adopt on first join, on a newer epoch, or on an equal epoch with a
+    // DIFFERENT key (a restarted creator re-uses epoch 1 with a fresh key).
+    if !st.codec.conv_keys.contains_key(&conv_id) || epoch > current
+        || (epoch == current && cur_key.map(|k| k != group_key).unwrap_or(false))
+    {
         return adopt_key(st, transport, conv_id, epoch, group_key);
     }
     None
@@ -536,6 +593,7 @@ fn send_step(st: &mut ClientState, conv_id: u16) -> Option<(Vec<u8>, u32)> {
 fn init_own_chain(st: &mut ClientState, transport: &Transport, conv_id: u16, epoch: u16) {
     let seed: [u8; 32] = rand::random();
     set_chain(st, conv_id, epoch, st.sender_id, ChainState { key: seed.to_vec(), index: 0 });
+    st.chain_seeds.entry(conv_id).or_default().insert(epoch, ChainState { key: seed.to_vec(), index: 0 });
     st.chain_shared_with.insert(conv_id, HashSet::new());
     share_chain_with_members(st, transport, conv_id, epoch);
 }
@@ -944,6 +1002,21 @@ fn process_message_inner(
                         }
                     }
                 }
+                // The NACKer likely missed the chain share too (it can't
+                // decrypt my stream without one). Re-share the chain SEED
+                // (index 0) so it can reach back and decrypt the whole epoch,
+                // not just future messages.
+                let epoch = *st.codec.current_epochs.get(&nack_conv_id).unwrap_or(&1);
+                if let Some(seed) = st.chain_seeds.get(&nack_conv_id).and_then(|m| m.get(&epoch)) {
+                    let seed = seed.clone();
+                    if let Some(share_buf) = build_chain_share(
+                        st, &st.ecdh.as_ref().unwrap().clone(), nack_conv_id, epoch,
+                        nack_sender_id, &peer_pub, &seed.key, seed.index,
+                    ) {
+                        let sock = transport.clone();
+                        tokio::spawn(async move { let _ = sock.send(&share_buf).await; });
+                    }
+                }
             }
         }
         
@@ -1021,6 +1094,7 @@ fn process_message_inner(
             };
             if let Ok(ack) = st.codec.decode_ack(&stripped) {
                 if seq_delta(st.highest_sent_seq, ack.seq) < SEQ_MOD / 2 {
+                    st.acked_seq.insert(ack.conv_id, ack.seq);
                     println!("\x1b[90m[✓] Delivered (Seq {})                                  \x1b[0m", ack.seq);
                 }
             }

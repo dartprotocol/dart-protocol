@@ -67,6 +67,23 @@ func TestDataRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseNackWithoutKey(t *testing.T) {
+	c := newTestCodec()
+	nack := &NackDart{Type: TypeNack, ConvId: 1, SenderId: 7, TargetId: 9, MissingSeq: []uint32{1, 2, 3}}
+	buf, err := c.EncodeNack(nack, testNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A codec with no group key must still be able to read the gap list.
+	blind, err := ParseNack(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blind.SenderId != 7 || blind.TargetId != 9 || len(blind.MissingSeq) != 3 || blind.MissingSeq[2] != 3 {
+		t.Errorf("parseNack wrong: %+v", blind)
+	}
+}
+
 func TestNackRoundTrip(t *testing.T) {
 	c := newTestCodec()
 	nack := &NackDart{Type: TypeNack, ConvId: 1, SenderId: 7, TargetId: 9, MissingSeq: []uint32{1, 2, 3}}
@@ -226,7 +243,7 @@ func TestGoldenNack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertHex(t, "nack", buf, "02000100070009000102030405060708090a0b13e0b6137aa335f614b8d0b1113eab3b1b2b9066d92634fe4bc878")
+	assertHex(t, "nack", buf, "02000100070009000102030405060708090a0b00030000010000020000036e3fdcea13a7d1a81d67e2a9149581c4")
 	dec, err := c.DecodeNack(buf)
 	if err != nil || dec.SenderId != 7 || len(dec.MissingSeq) != 3 {
 		t.Errorf("golden nack decode wrong: %+v err=%v", dec, err)

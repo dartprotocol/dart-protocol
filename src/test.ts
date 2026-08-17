@@ -1,6 +1,6 @@
 import { DartClient } from './client';
 import { DartGroupServer } from './server';
-import { Codec, SEQ_MOD, TYPE_NACK, pairwiseKey, signControlFrame, currentEpochs, advanceChain, chainMessageKey, chainNextKey } from './core';
+import { Codec, SEQ_MOD, TYPE_NACK, pairwiseKey, signControlFrame, advanceChain, chainMessageKey, chainNextKey } from './core';
 
 async function delay(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -8,6 +8,8 @@ async function delay(ms: number) {
 
 async function runTests() {
   console.log("Starting Dart Protocol Group Server Tests...\n");
+  let failed = 0;
+  const check = (ok: boolean) => { if (!ok) failed++; };
 
   const server = new DartGroupServer(9000);
 
@@ -120,6 +122,7 @@ async function runTests() {
     if (!ok) wrapOk = false;
     console.log(`  seq 0x${expected[i].toString(16)} payload=${dart ? JSON.stringify(dart.payload) : 'MISSING'} ${ok ? 'OK' : 'FAIL'}`);
   }
+  check(wrapOk);
   console.log(wrapOk ? "Wrap test PASS" : "Wrap test FAIL");
 
   // --- Test 5: Per-sender control-frame auth (forgery resistance) ---
@@ -134,32 +137,37 @@ async function runTests() {
 
   // B forges a NACK claiming to be C, targeting A, for a message A sent.
   // B signs it with B's own key; A verifies against C's key -> must reject.
+  const groupKey = clientB.getCurrentKey(1);
+  if (!groupKey) throw new Error('client B has no group key');
   const forgedNack = { type: TYPE_NACK, convId: 1, senderId: clientC.senderId, targetId: clientA.senderId, missingSeq: [1] };
-  const forgedBuf = Codec.encodeNack(forgedNack);
+  const forgedBuf = Codec.encodeNack(forgedNack, groupKey);
   const forgedSigned = signControlFrame(forgedBuf, pairwiseKey((clientB as any).clientECDH, aPub));
   sendUdp(forgedSigned);
   await delay(200);
   const forgedRetrans = (clientA as any).stats.retransmits;
+  check(forgedRetrans === 0);
   console.log(`  A retransmits after FORGED NACK (expect 0): ${forgedRetrans} ${forgedRetrans === 0 ? 'OK' : 'FAIL'}`);
 
   // Positive control: B sends a genuine NACK (senderId=B) -> A must retransmit.
   const realNack = { type: TYPE_NACK, convId: 1, senderId: clientB.senderId, targetId: clientA.senderId, missingSeq: [1] };
-  const realBuf = Codec.encodeNack(realNack);
+  const realBuf = Codec.encodeNack(realNack, groupKey);
   const realSigned = signControlFrame(realBuf, pairwiseKey((clientB as any).clientECDH, aPub));
   sendUdp(realSigned);
   await delay(200);
   const realRetrans = (clientA as any).stats.retransmits;
+  check(realRetrans >= 1);
   console.log(`  A retransmits after GENUINE NACK (expect >= 1): ${realRetrans} ${realRetrans >= 1 ? 'OK' : 'FAIL'}`);
 
   // B forges a DictReset claiming to be C, targeting A (server-verified path).
   // The server must reject it, so A's history survives.
   const forgedReset = { type: 0x06, convId: 1, senderId: clientC.senderId, targetId: clientA.senderId };
-  const forgedResetBuf = Codec.encodeDictReset(forgedReset);
+  const forgedResetBuf = Codec.encodeDictReset(forgedReset, groupKey);
   const sPub = (clientB as any).serverPubKeys.get(1);
   const forgedResetSigned = signControlFrame(forgedResetBuf, pairwiseKey((clientB as any).clientECDH, sPub));
   (clientB as any).broadcast(forgedResetSigned);
   await delay(200);
   const historyIntact = (clientA as any).sentMessages.has(1);
+  check(historyIntact);
   console.log(`  A history intact after FORGED DictReset (expect true): ${historyIntact} ${historyIntact ? 'OK' : 'FAIL'}`);
 
   // --- Test 7: Per-message ratchet properties ---
@@ -184,6 +192,7 @@ async function runTests() {
     chainMessageKey(gSeed, 0).equals(Buffer.from('e4b4d1bdd01191ce786b8f5efe2202757d94378135ad772bb9e01ed22d8ce688', 'hex')) &&
     chainNextKey(gSeed).equals(Buffer.from('4f174eacd84d526c6e0ebd801d14be1a17b4b87d740f1d9518349204546d5e38', 'hex')) &&
     advanceChain({ key: gSeed, index: 0 }, 2).messageKey.equals(Buffer.from('1ded480040e14f6fba5be12a1666a3542dec36f01629c21411b9d5f80bce05a0', 'hex'));
+  check(keysDistinct && ratcheted && gapConsistent && labeled && gMatch);
   console.log(`  keys distinct: ${keysDistinct} ${keysDistinct ? 'OK' : 'FAIL'}`);
   console.log(`  chain ratcheted (one-way): ${ratcheted} ${ratcheted ? 'OK' : 'FAIL'}`);
   console.log(`  gap-consistent (loss tolerance): ${gapConsistent} ${gapConsistent ? 'OK' : 'FAIL'}`);
@@ -192,16 +201,17 @@ async function runTests() {
 
   // --- Test 6: Creator departure -> successor election + immediate rekey ---
   console.log("--- Test 6: Creator departure (successor takes over rotation) ---");
-  const epochBefore = currentEpochs.get(1) || 1;
+  const epochBefore = clientB.currentEpoch(1);
   // Simulate the creator (A=8001) leaving: the server elects the smallest
   // remaining senderId (B=8002) as the new creator and notifies everyone.
   (server as any).removePeer('udp:127.0.0.1:8001');
   await delay(500);
   const bIsCreator = (clientB as any).isCreator.get(1) === true;
   const cIsCreator = (clientC as any).isCreator.get(1) === true;
-  const epochAfter = currentEpochs.get(1) || 1;
+  const epochAfter = clientB.currentEpoch(1);
   const successorElected = bIsCreator && !cIsCreator;
   const rekeyed = epochAfter > epochBefore;
+  check(successorElected && rekeyed);
   console.log(`  B isCreator=${bIsCreator} C isCreator=${cIsCreator} (expect true/false) ${successorElected ? 'OK' : 'FAIL'}`);
   console.log(`  epoch ${epochBefore} -> ${epochAfter} (expect bumped) ${rekeyed ? 'OK' : 'FAIL'}`);
 
@@ -212,7 +222,11 @@ async function runTests() {
   clientE.close();
   clientF.close();
   server.close();
-  console.log("Tests Complete.");
+  if (failed > 0) {
+    console.log(`\nTests Complete: ${failed} FAILED`);
+    process.exit(1);
+  }
+  console.log("\nTests Complete: all checks passed.");
 }
 
 runTests().catch(console.error);

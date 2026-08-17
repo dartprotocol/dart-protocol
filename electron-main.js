@@ -3,8 +3,8 @@ const path = require('path');
 
 function createWindow () {
   const win = new BrowserWindow({
-    width: 900,
-    height: 700,
+    width: 720,
+    height: 560,
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: true,
@@ -14,6 +14,7 @@ function createWindow () {
 
   win.setMenuBarVisibility(false);
   win.loadFile('public/electron.html');
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
 app.whenReady().then(() => {

@@ -29,8 +29,12 @@ npm run bench:endtoend      # real clients/servers, many users
   server-held conversation key.
 - Add or update the `check_sync.go` / `rust/src/bin/check_sync.rs` /
   `test_sync.js` cross-language format checks when the SYNC frame changes.
-- Update `PROTOCOL.md`, `README.md` and the `public/` docs when behaviour
-  changes — the docs must always tell the truth.
+- Update `PROTOCOL.md` as a **present-tense spec** of the current wire format,
+  not a changelog of previous drafts. Recite the whole file after a format
+  change; do not patch one section and leave a contradicting paragraph in
+  another. Then update `README.md` and `SECURITY.md` to match.
+- `public/PROTOCOL.md`, `public/README.md` and `public/SECURITY.md` are
+  pointers to the root files — do not fork a second copy of the spec.
 - Follow the existing code style in the file you are editing.
 
 ## Code of conduct
