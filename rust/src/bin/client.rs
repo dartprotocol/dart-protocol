@@ -118,7 +118,7 @@ struct ClientState {
     sender_chains: HashMap<u16, HashMap<u16, HashMap<u16, ChainState>>>,
     chain_shared_with: HashMap<u16, HashSet<u16>>,
     // Cached per-message keys (and chain index) by seq, for retransmission.
-    message_keys: HashMap<u32, (Vec<u8>, u32)>,
+    message_keys: HashMap<u32, (Vec<u8>, u32, u16)>,
     acked_seq: HashMap<u16, u32>,
     // Index-0 chain state per epoch, so a receiver that lost the chain share
     // can be given a state that reaches back to the epoch start.
@@ -385,12 +385,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload: text,
             };
             st.sent_messages.insert(seq, dart.clone());
-            st.message_keys.insert(seq, (message_key.clone(), idx));
+            let epoch = *st.codec.current_epochs.get(&st.room_id).unwrap_or(&1);
+            st.message_keys.insert(seq, (message_key.clone(), idx, epoch));
             st.highest_sent_seq = seq;
             st.prune_sent();
 
             let dict = st.get_dictionary(st.sender_id, seq);
-            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, None) {
+            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, epoch, None) {
                 transport.send(&buf).await;
                 print!("\x1b[90m[↑] Sending Seq {}...\x1b[0m\r", seq);
                 io::stdout().flush().unwrap();
@@ -744,7 +745,8 @@ fn adopt_key(
         st.prune_sent();
         let dict = st.get_dictionary(st.sender_id, dart.seq);
         if let Some((message_key, idx)) = send_step(st, conv_id) {
-            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, None) {
+            st.message_keys.insert(dart.seq, (message_key.clone(), idx, epoch));
+            if let Ok(buf) = st.codec.encode_data(&dart, &dict, &message_key, idx, epoch, None) {
                 let sock = transport.clone();
                 let mut queue = Vec::new();
                 std::mem::swap(&mut queue, &mut st.pending_queue);
@@ -993,9 +995,9 @@ fn process_message_inner(
                 println!("\x1b[33m[SYSTEM] Receiver missed seqs {:?}. Sending NACK repairs...\x1b[0m", nack.missing_seq);
                 for seq in nack.missing_seq {
                     if let Some(dart) = st.sent_messages.get(&seq) {
-                        if let Some((message_key, idx)) = st.message_keys.get(&seq).cloned() {
+        if let Some((message_key, idx, epoch)) = st.message_keys.get(&seq).cloned() {
                             let dict = st.get_dictionary(st.sender_id, seq);
-                            if let Ok(out_buf) = st.codec.encode_data(dart, &dict, &message_key, idx, None) {
+                            if let Ok(out_buf) = st.codec.encode_data(dart, &dict, &message_key, idx, epoch, None) {
                                 let sock = transport.clone();
                                 tokio::spawn(async move { let _ = sock.send(&out_buf).await; });
                             }

@@ -149,7 +149,7 @@ class NativeDartClient {
         this.nextSeq = seqNext(this.nextSeq);
         const dart: DataDart = { type: TYPE_DATA, convId, senderId: this.senderId, seq, payload };
         this.sentMessages.set(seq, dart);
-        this.messageKeys.set(seq, { key: messageKey, idx });
+        this.messageKeys.set(seq, { key: messageKey, idx, epoch });
         this.highestSentSeq = seq;
         this.pruneSent();
         
@@ -282,7 +282,7 @@ class NativeDartClient {
                     const mk = this.messageKeys.get(seq);
                     if (dart && mk) {
                         const dict = this.getDictionary(this.senderId, seq);
-                        const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, this.currentEpochs.get(dart.convId) || 1);
+                        const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, mk.epoch);
                         this.broadcast(outBuf);
                     }
                 }
@@ -394,7 +394,7 @@ class NativeDartClient {
     // Per-sender ratchet chains: convId -> epoch -> senderId -> chain state.
     private senderChains = new Map<number, Map<number, Map<number, ChainState>>>();
     private chainSharedWith = new Map<number, Set<number>>();
-    private messageKeys = new Map<number, { key: Buffer; idx: number }>();
+    private messageKeys = new Map<number, { key: Buffer; idx: number; epoch: number }>();
     private chainSeeds = new Map<number, Map<number, ChainState>>(); // convId -> epoch -> index-0 chain state
     // The epoch this client has adopted (per-client, unlike the shared codec
     // globals) so each member creates its own ratchet chain.

@@ -155,10 +155,12 @@ func (c *Codec) getConvKey(convId uint16) ([]byte, error) {
 	return nil, errors.New("no conversation key established")
 }
 
-func (c *Codec) EncodeData(dart *DataDart, dict []byte, messageKey []byte, idx uint32, nonce []byte) ([]byte, error) {
-	epoch := c.CurrentEpochs[dart.ConvId]
+func (c *Codec) EncodeData(dart *DataDart, dict []byte, messageKey []byte, idx uint32, epoch uint16, nonce []byte) ([]byte, error) {
 	if epoch == 0 {
-		epoch = 1
+		epoch = c.CurrentEpochs[dart.ConvId]
+		if epoch == 0 {
+			epoch = 1
+		}
 	}
 
 	var compressed bytes.Buffer

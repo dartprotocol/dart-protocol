@@ -50,7 +50,7 @@ func newTestCodec() *Codec {
 func TestDataRoundTrip(t *testing.T) {
 	c := newTestCodec()
 	dart := &DataDart{Type: TypeData, ConvId: 1, SenderId: 7, Seq: 9, Payload: "hello dart"}
-	buf, err := c.EncodeData(dart, nil, testMsgKey, 3, testNonce)
+	buf, err := c.EncodeData(dart, nil, testMsgKey, 3, 1, testNonce)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +64,23 @@ func TestDataRoundTrip(t *testing.T) {
 	payload, err := InflateData(dec.Compressed, nil)
 	if err != nil || string(payload) != "hello dart" {
 		t.Errorf("payload = %q err = %v", payload, err)
+	}
+}
+
+func TestDataExplicitEpochSurvivesCurrentEpochChange(t *testing.T) {
+	c := newTestCodec()
+	c.CurrentEpochs[1] = 2
+	dart := &DataDart{Type: TypeData, ConvId: 1, SenderId: 7, Seq: 9, Payload: "old epoch"}
+	buf, err := c.EncodeData(dart, nil, testMsgKey, 3, 1, testNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := c.DecryptData(buf, testMsgKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Epoch != 1 {
+		t.Fatalf("explicit epoch was replaced by current epoch: got %d", dec.Epoch)
 	}
 }
 

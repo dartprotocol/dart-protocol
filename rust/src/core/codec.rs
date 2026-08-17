@@ -34,8 +34,12 @@ impl Codec {
             .ok_or_else(|| format!("no conversation key established for conv {}", conv_id))
     }
 
-    pub fn encode_data(&self, dart: &DataDart, dict: &[u8], message_key: &[u8], idx: u32, nonce: Option<[u8; 12]>) -> Result<Vec<u8>, String> {
-        let epoch = *self.current_epochs.get(&dart.conv_id).unwrap_or(&1);
+    pub fn encode_data(&self, dart: &DataDart, dict: &[u8], message_key: &[u8], idx: u32, epoch: u16, nonce: Option<[u8; 12]>) -> Result<Vec<u8>, String> {
+        let epoch = if epoch == 0 {
+            *self.current_epochs.get(&dart.conv_id).unwrap_or(&1)
+        } else {
+            epoch
+        };
 
         let mut compressor = Compress::new(Compression::default(), false);
         if !dict.is_empty() {
@@ -636,7 +640,7 @@ mod tests {
     fn roundtrip_data() {
         let c = test_codec();
         let dart = DataDart { conv_id: 1, sender_id: 7, seq: 9, payload: "hello dart".to_string() };
-        let buf = c.encode_data(&dart, &[], &rep(0x22, 32), 3, Some(NONCE)).unwrap();
+        let buf = c.encode_data(&dart, &[], &rep(0x22, 32), 3, 1, Some(NONCE)).unwrap();
         let dec = c.decrypt_data(&buf, &rep(0x22, 32)).unwrap();
         assert_eq!(dec.conv_id, 1);
         assert_eq!(dec.sender_id, 7);
@@ -644,6 +648,16 @@ mod tests {
         assert_eq!(dec.idx, 3);
         let payload = Codec::inflate_data(&dec.compressed, &[]).unwrap();
         assert_eq!(payload, "hello dart");
+    }
+
+    #[test]
+    fn explicit_epoch_survives_current_epoch_change() {
+        let mut c = test_codec();
+        c.current_epochs.insert(1, 2);
+        let dart = DataDart { conv_id: 1, sender_id: 7, seq: 9, payload: "old epoch".to_string() };
+        let buf = c.encode_data(&dart, &[], &rep(0x22, 32), 3, 1, Some(NONCE)).unwrap();
+        let dec = c.decrypt_data(&buf, &rep(0x22, 32)).unwrap();
+        assert_eq!(dec.epoch, 1);
     }
 
     #[test]

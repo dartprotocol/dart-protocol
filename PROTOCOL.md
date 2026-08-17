@@ -123,7 +123,7 @@ member's control frames:
 2. **Receiver:** Receives `N`. If `N` == `Highest_Received + 1`, update `Highest_Received`. Do nothing (Silence).
 3. **Receiver (Loss):** Receives `N+2`. Realizes `N+1` is missing. Sends a NACK for `N+1`.
 4. **Relay:** Reads the cleartext gap list. If the missing dart is in the sliding-window cache, it repairs from RAM. It **always** also relays the member-signed NACK to the target (original sender) — the sender must see the NACK to re-share its ratchet-chain seed when the receiver lost that share, and to retransmit if the cache missed.
-5. **Sender (NACK):** Receives a NACK for `N+1`. Retransmits `N+1` re-compressed against the current dictionary, and re-shares its chain seed so the receiver can decrypt the retransmitted backlog.
+5. **Sender (NACK):** Receives a NACK for `N+1`. Retransmits `N+1` re-compressed against the current dictionary, but preserves the message's **original ratchet epoch** on the wire and reuses its cached per-message key. It also re-shares its chain seed so the receiver can decrypt the retransmitted backlog.
 6. **Receiver persistence:** The receiver keeps re-NACKing an outstanding gap on a short timer until it closes, and the sender keeps re-probing (SYNC) while its latest message stays unacknowledged — a lost repair round can therefore never stall the conversation silently.
 7. **Termination:** After 200ms of silence, the receiver sends one hybrid ACK so the sender stops probing.
 

@@ -30,7 +30,7 @@ To protect the "Final Message" in a burst from hanging in silence, Dart adds a *
 
 ## 📦 Packet Types
 Dart uses a compact binary framing format. The canonical layout is in [PROTOCOL.md](PROTOCOL.md).
-- **`TYPE_DATA` (0x01):** 7-byte header (`type | convId | seq | extLen`) + 24-byte cleartext extension (`senderId | nonce | epoch | dictFp | idx`) + deflate(message) encrypted under the sender's **per-message ratchet key**. `senderId` is in the extension so the receiver can select the right chain before decrypting.
+- **`TYPE_DATA` (0x01):** 7-byte header (`type | convId | seq | extLen`) + 24-byte cleartext extension (`senderId | nonce | epoch | dictFp | idx`) + deflate(message) encrypted under the sender's **per-message ratchet key**. `senderId` is in the extension so the receiver can select the right chain before decrypting. Retransmissions retain the original message `epoch` and cached message key rather than using the sender's newer current epoch.
 - **`TYPE_NACK` (0x02):** Sent by a receiver who detects a sequence gap. Missing sequence numbers are **cleartext** so a blind relay can repair from cache without the group key; GCM + per-sender HMAC still authenticate the frame.
 - **`TYPE_SYNC` (0x03):** A sparse probe sent by a sender (e.g., at 300ms) to ensure their last message wasn't silently dropped.
 - **`TYPE_KEY_REQ` (0x04):** Publishes the member's public key when joining a room. Registration is last-writer-wins (a restart with a fresh keypair re-binds the `senderId`); the server re-broadcasts the roster on every KeyReq, and clients re-send their KeyReq after joining so a lost roster update is never permanent.
@@ -213,4 +213,3 @@ cd rust && cargo build   # Rust build check
 ## ⚖️ License
 
 [ISC](LICENSE) — free to use, modify and distribute.
-

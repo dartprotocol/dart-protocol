@@ -51,7 +51,7 @@ export class DartClient {
   // Members I've shared my chain with this epoch (reset on adoptKey).
   private chainSharedWith = new Map<number, Set<number>>();
   // Cached per-message keys (and their chain index) by seq, for retransmission.
-  private messageKeys = new Map<number, { key: Buffer; idx: number }>();
+  private messageKeys = new Map<number, { key: Buffer; idx: number; epoch: number }>();
   // Initial chain state (index 0) per epoch, so a receiver that lost the
   // chain share can be given a state that reaches back to the epoch start.
   private chainSeeds = new Map<number, Map<number, ChainState>>();
@@ -446,7 +446,7 @@ export class DartClient {
     this.highestSentSeq = seq;
     const dart: DataDart = { type: TYPE_DATA, convId, senderId: this.senderId, seq, payload };
     this.sentMessages.set(seq, dart);
-    this.messageKeys.set(seq, { key: messageKey, idx });
+    this.messageKeys.set(seq, { key: messageKey, idx, epoch });
     this.pruneSent();
     this.messageStatus.set(seq, 'sent');
     
@@ -567,7 +567,7 @@ export class DartClient {
           if (dart && mk) {
             this.stats.retransmits++;
             const dict = this.getDictionary(this.senderId, seq);
-            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, this.currentEpochs.get(dart.convId) || 1);
+            const outBuf = Codec.encodeDataHelper(dart, dict, mk.key, mk.idx, mk.epoch);
             this.broadcast(outBuf);
             
             // Reset optimistic timer

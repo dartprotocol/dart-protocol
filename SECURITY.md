@@ -22,7 +22,10 @@ See also the [Roadmap](README.md#-roadmap--todo) in the README.
   key derived from each sender's one-way ratchet chain: a compromised message
   key decrypts only that one message, and a compromised chain state reveals
   future (not past) messages in that epoch. Chains are distributed
-  member-to-member via `CHAIN_SHARE`, relayed opaquely by the server. Residual:
+  member-to-member via `CHAIN_SHARE`, relayed opaquely by the server.
+  Retransmissions retain the original message epoch and cached message key,
+  preventing a newer epoch label from being paired with an older epoch's key.
+  Residual:
   a member's long-term key is used to encrypt its chain shares, so a long-term
   compromise exposes the epochs that member participated in.
 - **Pinning is not a public PKI.** Server authentication relies on out-of-band

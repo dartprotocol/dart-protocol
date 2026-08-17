@@ -24,6 +24,7 @@ import (
 type messageKeyEntry struct {
 	key []byte
 	idx uint32
+	epoch uint16
 }
 
 type NativeDartClient struct {
@@ -280,12 +281,12 @@ func (c *NativeDartClient) SendData(roomId uint16, payload string) {
 		Payload:  payload,
 	}
 	c.sentMessages[seq] = dart
-	c.messageKeys[seq] = messageKeyEntry{key: messageKey, idx: idx}
+	c.messageKeys[seq] = messageKeyEntry{key: messageKey, idx: idx, epoch: epoch}
 	c.highestSentSeq = seq
 	c.pruneSent()
 
 	dict := c.getDictionary(c.senderId, seq)
-	buf, err := c.codec.EncodeData(dart, dict, messageKey, idx, nil)
+	buf, err := c.codec.EncodeData(dart, dict, messageKey, idx, epoch, nil)
 	if err == nil {
 		c.send(buf)
 	}
@@ -946,7 +947,7 @@ func (c *NativeDartClient) handleMessage(buf []byte) {
 			if dart, ok := c.sentMessages[seq]; ok {
 				if mk, ok := c.messageKeys[seq]; ok {
 					dict := c.getDictionary(c.senderId, seq)
-					outBuf, _ := c.codec.EncodeData(dart, dict, mk.key, mk.idx, nil)
+					outBuf, _ := c.codec.EncodeData(dart, dict, mk.key, mk.idx, mk.epoch, nil)
 					c.send(outBuf)
 				}
 			}
