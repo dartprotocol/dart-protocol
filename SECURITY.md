@@ -30,8 +30,10 @@ See also the [Roadmap](README.md#-roadmap--todo) in the README.
   certificates or certificate authorities.
 - **No room access control.** Knowing a 16-bit conversation ID is enough to
   send `KEY_REQ`. Pinning authenticates the server, not members. `senderId` is
-  client-chosen; the server only refuses to bind one id to two different
-  public keys.
+  client-chosen and registration is **last-writer-wins**: a member
+  reconnecting with a fresh ECDH keypair overwrites their old roster entry
+  (required for UDP reconnects — there is no close event to expire a binding)
+  — which also means an offline member's id can be claimed by a newcomer.
 - **Routing metadata is cleartext.** Conversation IDs, sequence numbers, NACK
   gap lists and control signalling are visible on the wire; the server knows
   who talks to whom in which room (content is end-to-end encrypted, the server
