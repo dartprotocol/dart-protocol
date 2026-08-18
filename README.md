@@ -9,6 +9,44 @@ An experimental messaging protocol built around a **Hybrid "Silence = Success" A
 
 > **Experimental.** The wire format matches the current TypeScript, Go and Rust implementations (verified interoperable in all combinations), but the security model has known limitations — see [Security Model](#-security-model), [Known Limitations](#-known-limitations) and [SECURITY.md](SECURITY.md). Do not deploy as-is.
 
+## 🎯 Scope: What Dart Provides (and What It Doesn't)
+
+Dart is an experimental **transport & framing protocol** for low-latency group
+messaging. It is a building block for an application, not an application
+framework.
+
+**Dart handles:**
+- Binary packet framing and reliability (NACK repair, hybrid ACKs, sequence
+  tracking) over UDP, with a TCP fallback and a WebSocket bridge for browsers.
+- End-to-end payload encryption via per-message ratchet keys, plus group-key
+  authentication of control frames.
+- A canonical wire format implemented byte-for-byte in TypeScript, Go and Rust.
+
+**Dart does not handle — by design. These belong to the application:**
+- **User identity & authentication.** `senderId` is a protocol handle chosen by
+  the client; mapping it to real usernames, accounts, or sessions is the
+  application's job.
+- **Room access control & authorization.** The 16-bit `convId` is a routing
+  identifier, not a permission system. Applications should gate room access
+  before allowing a client to send a `KEY_REQ`.
+- **Rate limiting, spam filtering, or abuse prevention.**
+- **Public-key infrastructure.** Server identity is verified via fingerprint
+  pinning; applications needing real certificates/PKI must layer it on top.
+
+**Boundaries the wire format itself imposes (see [PROTOCOL.md](PROTOCOL.md)):**
+- **16-bit `convId`** is both short and guessable — a small room-ID space that
+  application-level gates should treat as public.
+- **`senderId` binding is last-writer-wins** — a fresh UDP socket can reclaim an
+  offline member's id, so application identity should not rely on `senderId`
+  persisting across reconnects.
+- **Routing metadata is cleartext** — `convId`, `seq`, `senderId`, and NACK gap
+  lists are visible; the server knows who talks to whom in which room. Hiding
+  this requires a different topology (mesh/P2P/mix network) and is out of scope.
+
+Because applying security at the application boundary is delegable but the wire
+constraints above are not, treat this as a **transport layer**: build your own
+authentication and access control in front of it, and do not deploy it as-is
+for sensitive traffic.
 ## 📁 Repository Layout
 
 ```
