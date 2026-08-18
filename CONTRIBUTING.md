@@ -33,8 +33,6 @@ npm run bench:endtoend      # real clients/servers, many users
   not a changelog of previous drafts. Recite the whole file after a format
   change; do not patch one section and leave a contradicting paragraph in
   another. Then update `README.md` and `SECURITY.md` to match.
-- `public/PROTOCOL.md`, `public/README.md` and `public/SECURITY.md` are
-  pointers to the root files — do not fork a second copy of the spec.
 - Follow the existing code style in the file you are editing.
 
 ## Code of conduct

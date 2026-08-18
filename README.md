@@ -54,7 +54,6 @@ for sensitive traffic.
 ├── src/            TypeScript codec + clients (CLI, Web, Electron, sim) + server
 ├── go/             Go codec, native client and server
 ├── rust/           Rust codec, native client and server
-├── public/         The project's website + WebSocket web client (demo)
 ├── bench_endtoend.js   Real end-to-end benchmark (all servers × all clients)
 ├── PROTOCOL.md     Wire-format specification
 └── README.md
@@ -181,7 +180,7 @@ Ordered roughly by impact vs. effort.
 - [x] **Go + Rust unit tests** — `go/core/codec_test.go` (14 tests) and `rust/src/core/codec.rs` tests (14 tests) cover codec round-trips for every frame plus cross-language golden wire vectors (fixed nonces) generated from the TS reference; the ratchet-chain helpers are locked to byte-identical vectors across all three implementations. (`go test ./core/`, `cargo test`.)
 - [x] **24-bit seq wrap handling** — ordering/dedup/window state now lives in the modular 24-bit sequence space, so the counter wraps cleanly across the 16.7M boundary (verified by a wrap-boundary integration test).
 - [ ] **De-duplicate `web-app.ts` / `electron-gui.ts`** — the two clients are near-identical copies.
-- [ ] **Browser WebTransport (V2)** — replace the TCP/WebSocket bridge with QUIC datagrams so the browser gets true UDP semantics (see `public/v2.html`).
+- [ ] **Browser WebTransport (V2)** — replace the TCP/WebSocket bridge with QUIC datagrams so the browser gets true UDP semantics (see the V2 page on [dartprotocol.org](https://dartprotocol.org)).
 
 ### On "a different topology"
 The current design is a **star** (all clients → server), so the server must read convId/seq/senderId to route, cache, and repair. That metadata can never be hidden in this topology. Hiding it means moving to a **mesh/P2P** (server as rendezvous only, per-pair random room tokens) or an **onion/mix network**. The per-message ratchet does *not* need a topology change — it's a key-derivation redesign that works over the current star.
@@ -192,7 +191,7 @@ The current design is a **star** (all clients → server), so the server must re
 git clone https://github.com/<YOUR_USER>/<REPO>.git
 cd <REPO>
 npm install
-npm run build     # compiles TypeScript + builds the browser bundle
+npx tsc                 # compiles TypeScript → src/*.js (needed by the Node clients)
 ```
 
 **1. Compile and Start the Server (Go Native):**
@@ -200,16 +199,13 @@ npm run build     # compiles TypeScript + builds the browser bundle
 cd go/server && go build . && ./server
 ```
 
-**2. Chat from the Browser (WebSocket):**
-Open `http://localhost:9002` and type a Room ID.
-
-**3. Chat from the Terminal (Node.js UDP):**
+**2. Chat from the Terminal (Node.js UDP):**
 Open a new terminal window and run:
 ```bash
 node src/cli.js
 ```
 
-**4. Chat from the Terminal (Go Native UDP):**
+**3. Chat from the Terminal (Go Native UDP):**
 A fully idiomatic Go port is available in the `go/` directory. It uses Go's `compress/flate` dictionary mode and native `crypto/aes` to interoperate with the Node clients.
 ```bash
 cd go
@@ -217,7 +213,7 @@ go build -o dart-cli
 ./dart-cli
 ```
 
-**5. Chat from the Terminal (Rust Native UDP):**
+**4. Chat from the Terminal (Rust Native UDP):**
 A clean, idiomatic Rust port using Tokio is available in the `rust/` directory. It uses `flate2` and `aes-gcm`.
 ```bash
 cd rust
@@ -225,19 +221,22 @@ cargo build --release
 ./target/release/client
 ```
 
-**6. Chat from the Native Desktop GUI (Electron + UDP):**
-Open a new terminal window and run:
-```bash
-npx electron electron-main.js
-```
+Join the same Room ID on any client, and you can chat instantly across the
+Node, Go and Rust transports.
 
-Join the same Room ID on any client, and you can chat instantly across all transports (Node, Go, Rust, Browser, Electron).
+The browser **web client** (`src/web-app.ts`) and **Electron** desktop GUI
+(`src/electron-gui.ts`, `electron-main.js`) are part of the code, but the site
+assets that render them (demo page, built browser bundle, Electron shell) are
+served from [dartprotocol.org](https://dartprotocol.org) rather than this
+repository. A public hosted demo may or may not be offered; use the clients
+above to try the protocol directly.
 
 **Security note:** the server prints its fingerprint at startup. Pin it on every
-client (`DART_SERVER_FINGERPRINT=<fingerprint>`, or `SERVER_FINGERPRINT` in
-`public/web-app.ts`'s compiled bundle) so an attacker can't substitute their own
-server key. Optionally set `DART_REKEY_SECONDS` to tune group-key rotation, and
-`DART_TCP_FALLBACK=host:9001` to use the reliable TCP fallback transport.
+client (`DART_SERVER_FINGERPRINT=<fingerprint>`, or `SERVER_FINGERPRINT` in the
+browser client's source at `src/web-app.ts`) so an attacker can't substitute
+their own server key. Optionally set `DART_REKEY_SECONDS` to tune group-key
+rotation, and `DART_TCP_FALLBACK=host:9001` to use the reliable TCP fallback
+transport.
 
 ## 🧪 Tests & Benchmarks
 
