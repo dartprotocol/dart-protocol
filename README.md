@@ -4,6 +4,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-7-3178c6?logo=typescript&logoColor=white)](src/)
 [![Go](https://img.shields.io/badge/Go-1.15-00add8?logo=go&logoColor=white)](go/)
 [![Rust](https://img.shields.io/badge/Rust-1.97-dea584?logo=rust&logoColor=white)](rust/)
+[![Website](https://img.shields.io/badge/website-dartprotocol.org-blue.svg)](https://dartprotocol.org)
 
 An experimental messaging protocol built around a **Hybrid "Silence = Success" Architecture**: it minimizes network chatter by avoiding per-packet positive ACKs, encrypts every message **end-to-end** with member-generated group keys, and keeps the relay server **blind** to message content — implemented byte-for-byte identically in **TypeScript, Go and Rust**.
 
