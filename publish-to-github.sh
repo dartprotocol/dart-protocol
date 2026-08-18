@@ -87,5 +87,6 @@ else
   echo "    git push -u origin main"
   echo
   echo "Tip: name it e.g. 'dart-protocol' and add a short description."
-  echo "The website lives in public/ — enable GitHub Pages from the main branch root to serve it."
+  echo "Note: the live website is hosted separately at dartprotocol.org; the repo"
+  echo "keeps the website assets under public/ as part of the published source."
 fi
