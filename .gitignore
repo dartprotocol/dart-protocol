@@ -21,6 +21,10 @@ go/dart-cli
 go/server/server
 rust/target/
 
+# Session/refactor notes (generated locally, not published)
+CHANGES.md
+SERVER-CHANGES.md
+
 # OS / editor
 .DS_Store
 Thumbs.db
