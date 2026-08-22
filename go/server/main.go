@@ -41,18 +41,18 @@ type Peer struct {
 }
 
 type DartGroupServer struct {
-	udpConn  *net.UDPConn
-	codec    *core.Codec
+	udpConn    *net.UDPConn
+	codec      *core.Codec
 	serverECDH *core.ECDH
 
-	mu          sync.Mutex
-	groups      map[uint16][]*Peer
-	clientMap   map[uint16]map[uint16]*Peer
+	mu           sync.Mutex
+	groups       map[uint16][]*Peer
+	clientMap    map[uint16]map[uint16]*Peer
 	peerIdentity map[string]uint16
-	members     map[uint16]map[uint16][]byte // blind: public membership only
-	creator     map[uint16]uint16            // first member (generates/rotates the key)
+	members      map[uint16]map[uint16][]byte // blind: public membership only
+	creator      map[uint16]uint16            // first member (generates/rotates the key)
 	messageCache map[uint16]map[uint16]map[uint32][]byte
-	highestSeq  map[uint16]map[uint16]uint32
+	highestSeq   map[uint16]map[uint16]uint32
 
 	upgrader websocket.Upgrader
 }
@@ -137,17 +137,17 @@ func (s *DartGroupServer) StartUDP(port int) {
 			log.Printf("UDP Read Error: %v", err)
 			continue
 		}
-		
+
 		msg := make([]byte, n)
 		copy(msg, buf[:n])
-		
+
 		peerID := fmt.Sprintf("udp:%s", raddr.String())
 		peer := &Peer{
 			ID:      peerID,
 			Type:    PeerUDP,
 			UDPAddr: cloneUDPAddr(raddr),
 		}
-		
+
 		go s.handleMessage(msg, peer)
 	}
 }
@@ -165,13 +165,13 @@ func (s *DartGroupServer) StartWS(port int) {
 			Type:   PeerWS,
 			WSConn: conn,
 		}
-		
+
 		go func() {
 			defer func() {
 				s.removePeer(peerID)
 				conn.Close()
 			}()
-			
+
 			for {
 				msgType, msg, err := conn.ReadMessage()
 				if err != nil {
@@ -201,7 +201,7 @@ func (s *DartGroupServer) joinGroup(convId uint16, peer *Peer) {
 	for _, p := range group {
 		if p.ID == peer.ID {
 			found = true
-			
+
 			// Update the peer in place so we keep its state/socket
 			if p.Type == PeerUDP {
 				p.UDPAddr = cloneUDPAddr(peer.UDPAddr)
@@ -250,6 +250,11 @@ func (s *DartGroupServer) removePeer(peerId string) {
 					}
 					s.creator[convId] = successor
 				}
+			}
+			// Last member gone: drop the room entirely so the next KeyReq
+			// starts a fresh conversation (new creator, new epoch).
+			if len(s.members[convId]) == 0 {
+				delete(s.members, convId)
 			}
 		}
 		s.notifyMembersLocked(convId)
@@ -368,7 +373,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 	// Rate limiting logic
 	s.mu.Lock()
 	now := time.Now()
-	
+
 	var actualPeer *Peer
 	// Find or register actual peer for rate limiting state
 	found := false
@@ -389,7 +394,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		actualPeer.LastPacketTime = now
 		actualPeer.PacketCount = 0
 	}
-	
+
 	if now.Sub(actualPeer.LastPacketTime) > time.Second {
 		actualPeer.LastPacketTime = now
 		actualPeer.PacketCount = 0
@@ -407,9 +412,9 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		return
 	}
 	convId := binary.BigEndian.Uint16(buf[1:3])
-	
+
 	s.joinGroup(convId, actualPeer)
-	
+
 	s.mu.Lock()
 	if typ != core.TypeData && len(buf) >= 5 {
 		senderId := binary.BigEndian.Uint16(buf[3:5])
@@ -435,7 +440,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		}
 		seq := uint32(buf[3])<<16 | uint32(buf[4])<<8 | uint32(buf[5])
 		log.Printf("[Server] DataDart Conv:%d Sender:%d Seq:%d", convId, senderId, seq)
-		
+
 		s.mu.Lock()
 		if s.messageCache[convId] == nil {
 			s.messageCache[convId] = make(map[uint16]map[uint32][]byte)
@@ -444,13 +449,13 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 			s.messageCache[convId][senderId] = make(map[uint32][]byte)
 		}
 		s.messageCache[convId][senderId][seq] = buf
-		
+
 		if s.highestSeq[convId] == nil {
 			s.highestSeq[convId] = make(map[uint16]uint32)
 		}
 		_, hasBaseline := s.highestSeq[convId][senderId]
 		currentHighest := s.highestSeq[convId][senderId]
-		
+
 		// Modular gap test: 0 = duplicate, >= SeqMod/2 = stale, 1 = exact next.
 		// A fresh server (no baseline yet) treats the first packet as its
 		// baseline so joining mid-conversation (even near a wrap) works.
@@ -458,7 +463,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if hasBaseline {
 			ahead = core.SeqDelta(currentHighest, seq)
 		}
-		
+
 		// GC Cache: keep only the last 200 packets. The reference point is the
 		// modularly-newer of the two, so pruning stays correct across a wrap.
 		ref := seq
@@ -470,14 +475,14 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 				delete(s.messageCache[convId][senderId], k)
 			}
 		}
-		
+
 		// The server is blind (no group key / no member signing key), so it
 		// does not originate NACKs; loss recovery happens through member-signed
 		// NACKs, which the server repairs from cache or relays verbatim.
 		if ahead > 0 && ahead < core.SeqMod/2 {
 			s.highestSeq[convId][senderId] = seq
 		}
-		
+
 		// copy group to release lock
 		group := make([]*Peer, len(s.groups[convId]))
 		copy(group, s.groups[convId])
@@ -504,6 +509,16 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		s.mu.Lock()
 		if s.members[req.ConvId] == nil {
 			s.members[req.ConvId] = make(map[uint16][]byte)
+			s.creator[req.ConvId] = req.SenderId
+		}
+		// If the recorded creator has no live transport peer any more (its
+		// socket closed before a successor election), hand creatorship to the
+		// incoming member so key rotation can start.
+		if cid, ok := s.creator[req.ConvId]; ok {
+			if _, alive := s.clientMap[req.ConvId][cid]; !alive {
+				s.creator[req.ConvId] = req.SenderId
+			}
+		} else {
 			s.creator[req.ConvId] = req.SenderId
 		}
 		// Last-writer-wins: a client reconnects with a fresh ECDH keypair on
@@ -540,14 +555,14 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if err != nil {
 			return
 		}
-		
+
 		s.mu.Lock()
 		var missingFromServer []uint32
 		var cacheMap map[uint32][]byte
 		if s.messageCache[nack.ConvId] != nil {
 			cacheMap = s.messageCache[nack.ConvId][nack.TargetId]
 		}
-		
+
 		for _, seq := range nack.MissingSeq {
 			if cached, ok := cacheMap[seq]; ok {
 				s.sendToPeer(cached, actualPeer)
@@ -596,12 +611,12 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if _, ok := core.VerifyControlFrame(buf, key); !ok {
 			return
 		}
-		
+
 		s.mu.Lock()
 		group := make([]*Peer, len(s.groups[syncConvId]))
 		copy(group, s.groups[syncConvId])
 		s.mu.Unlock()
-		
+
 		for _, p := range group {
 			if p.ID != actualPeer.ID {
 				s.sendToPeer(buf, p)
@@ -628,7 +643,7 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 		if _, ok := core.VerifyControlFrame(buf, key); !ok {
 			return
 		}
-		
+
 		s.mu.Lock()
 		group := make([]*Peer, len(s.groups[resetConvId]))
 		copy(group, s.groups[resetConvId])
@@ -659,11 +674,11 @@ func (s *DartGroupServer) handleMessage(buf []byte, peer *Peer) {
 func main() {
 	fmt.Println("Starting Go Dart Group Server...")
 	server := NewDartGroupServer()
-	
+
 	go server.StartUDP(9000)
 	go server.StartTCP(9001)
 	go server.StartWS(9002)
-	
+
 	// Wait for interrupt signal
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)

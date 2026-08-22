@@ -170,6 +170,11 @@ export class DartGroupServer {
                         this.creator.set(convId, successor);
                     }
                 }
+                // Last member gone: drop the room entirely so the next KeyReq
+                // starts a fresh conversation (new creator, new epoch).
+                if (mems.size === 0) {
+                    this.members.delete(convId);
+                }
                 this.notifyMembers(convId);
             }
         }
@@ -312,6 +317,13 @@ export class DartGroupServer {
                 // (creator) and shared member-to-member.
                 if (!this.members.has(req.convId)) {
                     this.members.set(req.convId, new Map());
+                    this.creator.set(req.convId, req.senderId);
+                }
+                // If the recorded creator has no live transport peer any more
+                // (its socket closed before a successor election), hand
+                // creatorship to the incoming member so key rotation can start.
+                const creatorId = this.creator.get(req.convId);
+                if (creatorId === undefined || !this.clientMap.get(req.convId)?.has(creatorId)) {
                     this.creator.set(req.convId, req.senderId);
                 }
                 // Last-writer-wins: a client reconnects with a fresh ECDH keypair

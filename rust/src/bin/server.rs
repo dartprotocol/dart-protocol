@@ -333,6 +333,11 @@ async fn cleanup_peer(peer_id: &PeerId, state: &Arc<RwLock<ServerState>>, socket
                         s.creator.insert(*conv, successor);
                     }
                 }
+                // Last member gone: drop the room entirely so the next KeyReq
+                // starts a fresh conversation (new creator, new epoch).
+                if s.members.get(conv).map_or(false, |m| m.is_empty()) {
+                    s.members.remove(conv);
+                }
             }
         }
         convs
@@ -538,6 +543,17 @@ async fn handle_message(
                 let mut s = state.write().await;
                 let first = s.members.get(&req.conv_id).map_or(true, |m| m.is_empty());
                 if first {
+                    s.creator.insert(req.conv_id, req.sender_id);
+                }
+                // If the recorded creator has no live transport peer any more
+                // (its socket closed before a successor election), hand
+                // creatorship to the incoming member so key rotation can start.
+                let creator_alive = s
+                    .creator
+                    .get(&req.conv_id)
+                    .and_then(|cid| s.client_map.get(&req.conv_id).and_then(|m| m.get(cid)))
+                    .is_some();
+                if !creator_alive {
                     s.creator.insert(req.conv_id, req.sender_id);
                 }
                 // Last-writer-wins: a client reconnects with a fresh ECDH keypair
