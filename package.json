@@ -26,9 +26,7 @@
     },
     "files": [
       "electron-main.js",
-      "public/**/*",
-      "!public/*.zip",
-      "!public/*.exe",
+      "electron/**/*",
       "src/**/*.js",
       "package.json"
     ]

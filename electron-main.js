@@ -13,7 +13,7 @@ function createWindow () {
   });
 
   win.setMenuBarVisibility(false);
-  win.loadFile('public/electron.html');
+  win.loadFile('electron/electron.html');
   win.webContents.on('will-navigate', (e) => e.preventDefault());
 }
 
