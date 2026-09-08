@@ -8,8 +8,8 @@
 #   ./publish-to-github.sh https://github.com/USER/REPO.git   # commit AND push
 #
 # What is included: the protocol source (TypeScript/Go/Rust), codec, docs,
-# website HTML/CSS, tests and benchmark. What is excluded: node_modules,
-# compiled output, binaries, the 89MB desktop installers and the server's
+# tests and benchmark. What is excluded: node_modules, the website under
+# public/, compiled output, binaries, the desktop installers and the server's
 # private identity key (dart_server.key) — see .gitignore.
 #
 set -euo pipefail
@@ -87,6 +87,6 @@ else
   echo "    git push -u origin main"
   echo
   echo "Tip: name it e.g. 'dart-protocol' and add a short description."
-  echo "Note: the live website is hosted separately at dartprotocol.org; the repo"
-  echo "keeps the website assets under public/ as part of the published source."
+  echo "Note: the website is published to GitHub Pages from a separate repository;"
+  echo "the code repo keeps the site assets under public/ (gitignored)."
 fi

@@ -3,7 +3,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# Website (hosted separately at dartprotocol.org — not published with the code)
+# Website (hosted on GitHub Pages at dartprotocol.github.io — not published with the code)
 public/
 
 # Compiled TypeScript (regenerate with `npm run build`)

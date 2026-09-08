@@ -4,7 +4,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-7-3178c6?logo=typescript&logoColor=white)](src/)
 [![Go](https://img.shields.io/badge/Go-1.15-00add8?logo=go&logoColor=white)](go/)
 [![Rust](https://img.shields.io/badge/Rust-1.97-dea584?logo=rust&logoColor=white)](rust/)
-[![Website](https://img.shields.io/badge/website-dartprotocol.org-blue.svg)](https://dartprotocol.org)
+[![Website](https://img.shields.io/badge/website-GitHub%20Pages-blue.svg)](https://dartprotocol.github.io/)
 
 An experimental messaging protocol built around a **Hybrid "Silence = Success" Architecture**: it minimizes network chatter by avoiding per-packet positive ACKs, encrypts every message **end-to-end** with member-generated group keys, and keeps the relay server **blind** to message content — implemented byte-for-byte identically in **TypeScript, Go and Rust**.
 
@@ -180,7 +180,7 @@ Ordered roughly by impact vs. effort.
 - [x] **Go + Rust unit tests** — `go/core/codec_test.go` (14 tests) and `rust/src/core/codec.rs` tests (14 tests) cover codec round-trips for every frame plus cross-language golden wire vectors (fixed nonces) generated from the TS reference; the ratchet-chain helpers are locked to byte-identical vectors across all three implementations. (`go test ./core/`, `cargo test`.)
 - [x] **24-bit seq wrap handling** — ordering/dedup/window state now lives in the modular 24-bit sequence space, so the counter wraps cleanly across the 16.7M boundary (verified by a wrap-boundary integration test).
 - [ ] **De-duplicate `web-app.ts` / `electron-gui.ts`** — the two clients are near-identical copies.
-- [ ] **Browser WebTransport (V2)** — replace the TCP/WebSocket bridge with QUIC datagrams so the browser gets true UDP semantics (see the V2 page on [dartprotocol.org](https://dartprotocol.org)).
+- [ ] **Browser WebTransport (V2)** — replace the TCP/WebSocket bridge with QUIC datagrams so the browser gets true UDP semantics (see the V2 page on [the website](https://dartprotocol.github.io/v2.html)).
 
 ### On "a different topology"
 The current design is a **star** (all clients → server), so the server must read convId/seq/senderId to route, cache, and repair. That metadata can never be hidden in this topology. Hiding it means moving to a **mesh/P2P** (server as rendezvous only, per-pair random room tokens) or an **onion/mix network**. The per-message ratchet does *not* need a topology change — it's a key-derivation redesign that works over the current star.
@@ -188,8 +188,8 @@ The current design is a **star** (all clients → server), so the server must re
 ## 🚀 How to Run the Demo
 
 ```bash
-git clone https://github.com/<YOUR_USER>/<REPO>.git
-cd <REPO>
+git clone https://github.com/dartprotocol/dart-protocol.git
+cd dart-protocol
 npm install
 npx tsc                 # compiles TypeScript → src/*.js (needed by the Node clients)
 ```
@@ -225,11 +225,10 @@ Join the same Room ID on any client, and you can chat instantly across the
 Node, Go and Rust transports.
 
 The browser **web client** (`src/web-app.ts`) and **Electron** desktop GUI
-(`src/electron-gui.ts`, `electron-main.js`) are part of the code, but the site
-assets that render them (demo page, built browser bundle, Electron shell) are
-served from [dartprotocol.org](https://dartprotocol.org) rather than this
-repository. A public hosted demo may or may not be offered; use the clients
-above to try the protocol directly.
+(`src/electron-gui.ts`, `electron-main.js`) are part of the code, but their
+built site assets are not published in this repository. There is no hosted live
+demo; use the clients above to try the protocol directly. The project website
+lives on [GitHub Pages](https://dartprotocol.github.io/).
 
 **Security note:** the server prints its fingerprint at startup. Pin it on every
 client (`DART_SERVER_FINGERPRINT=<fingerprint>`, or `SERVER_FINGERPRINT` in the
