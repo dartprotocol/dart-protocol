@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dart Protocol | High-Performance Hybrid Networking</title>
+    <meta name="description" content="An experimental high-performance, multi-transport, multi-language chat protocol using a Silence=Success reliability model.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="bg-mesh"></div>
+    <div class="grid-overlay"></div>
+
+    <nav class="navbar">
+        <a href="#" class="nav-brand">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
+            </svg>
+            Dart Protocol
+        </a>
+        <input type="checkbox" id="nav-toggle" class="nav-toggle" />
+        <label for="nav-toggle" class="nav-toggle-btn" aria-label="Toggle navigation"><span></span><span></span><span></span></label>
+        <div class="nav-links">
+            <a href="#concept">Concept</a>
+            <a href="#architecture">Architecture</a>
+            <a href="#implementations">Implementations</a>
+            <a href="#benchmarks">Benchmarks</a>
+            <a href="#security">Security</a>
+            <a href="#docs">Docs & Tests</a>
+            <a href="use-cases.html">Use Cases</a>
+            <a href="why-dart.html">Why Dart?</a>
+            <a href="v2.html" class="highlight">V2 Roadmap</a>
+            <a href="https://github.com/dartprotocol/dart-protocol" target="_blank" rel="noopener" class="github-link">GitHub</a>
+        </div>
+    </nav>
+
+    <main>
+        <section class="hero container">
+            <div class="hero-content">
+                <div class="status-badge">
+                    <div class="status-indicator"></div>
+                    Working Prototype — Per-Message Ratchet · Server-Blind Relay
+                </div>
+                
+                <h1>Networking through <br><span class="text-gradient">Silence = Success</span></h1>
+                
+                <p class="hero-subtitle">
+                    Dart is an ultra-efficient, multi-transport experimental protocol. It replaces chatty positive ACKs with aggressive NACK memory caches, encrypts every message under a fresh key from a per-sender ratchet chain, authenticates control frames per-sender, and keeps the relay server completely blind to content — across Rust, Go, and the Web.
+                </p>
+
+                <div class="hero-badges">
+                    <div class="hero-badge">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                        Up to 50% Packet Savings
+                    </div>
+                    <div class="hero-badge">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                        UDP + TCP Fallback
+                    </div>
+                    <div class="hero-badge">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        Per-Message Ratchet E2EE
+                    </div>
+                    <div class="hero-badge">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 9.5-8 10-4.5-.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>
+                        Blind Relay (No Group Keys)
+                    </div>
+                </div>
+
+                <div class="hero-actions">
+                    <a href="#in-action" class="btn btn-accent">See It In Action</a>
+                    <a href="#implementations" class="btn btn-secondary">Explore Implementations</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="in-action" class="section container">
+            <div class="section-header">
+                <h2>See It In Action</h2>
+                <p>A native Go client over raw UDP and two browsers over the WebSocket bridge — three runtimes, one encrypted room, one blind relay. A dart is dropped mid-flight; watch the telemetry recover it.</p>
+            </div>
+            <div class="shot-grid">
+                <figure class="shot">
+                    <img src="screenshots/demo-conversation.png" alt="Dart Protocol demo: first browser client chatting with a Go native UDP client and a second browser through the blind relay" loading="lazy" />
+                    <figcaption>
+                        <strong>The creator's side.</strong> The Go native announced itself over raw UDP; its darts decode
+                        right beside the browsers'. When one dart drops mid-flight, the relay replays it from cache —
+                        <em>Cache Retransmits: 2</em>.
+                    </figcaption>
+                </figure>
+                <figure class="shot">
+                    <img src="screenshots/demo-response.png" alt="Dart Protocol demo: second browser client's view of the same room, showing NACK-based loss recovery telemetry" loading="lazy" />
+                    <figcaption>
+                        <strong>The receiver's side.</strong> Same room, different key material — every sender ratchets independently.
+                        The gap was detected, NACKed and repaired (<em>NACKs Issued: 3</em>), then silence again. Success.
+                    </figcaption>
+                </figure>
+            </div>
+        </section>
+
+        <section id="concept" class="section container">
+            <div class="section-header">
+                <h2>The Silence = Success Model</h2>
+                <p>Traditional protocols waste bandwidth acknowledging every packet. Dart assumes success, reacting only to detected failures.</p>
+            </div>
+
+            <div class="diagram-container">
+                <div class="diagram-col">
+                    <h3>Traditional (Positive ACK)</h3>
+                    <div class="flow">
+                        <div class="flow-step"><span class="step-node">Client</span><span class="step-msg data">Data (Seq 1) →</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Client</span><span class="step-msg ack">← ACK (Seq 1)</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Client</span><span class="step-msg data">Data (Seq 2) →</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Client</span><span class="step-msg ack">← ACK (Seq 2)</span><span class="step-node">Server</span></div>
+                        <div class="flow-step lost"><span class="step-node">Client</span><span class="step-msg data">Data (Seq 3) ✕</span><span class="step-node">Server</span></div>
+                        <div class="flow-label">Timeout Waiting for ACK</div>
+                        <div class="flow-step repair"><span class="step-node">Client</span><span class="step-msg data">Data (Seq 3) →</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Client</span><span class="step-msg ack">← ACK (Seq 3)</span><span class="step-node">Server</span></div>
+                    </div>
+                </div>
+                
+                <div class="diagram-col">
+                    <h3>Dart Protocol (NACK Only)</h3>
+                    <div class="flow">
+                        <div class="flow-step"><span class="step-node">Sender</span><span class="step-msg data">Data (Seq 1) →</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Server</span><span class="step-msg data">→ fan out</span><span class="step-node">Receiver</span></div>
+                        <div class="flow-label" style="background: rgba(16,185,129,0.1); color: #10b981; border-color: #10b981;">Silence — no ACKs sent</div>
+                        <div class="flow-step lost"><span class="step-node">Sender</span><span class="step-msg data">Data (Seq 2) ✕</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Sender</span><span class="step-msg data">Data (Seq 3) →</span><span class="step-node">Server</span></div>
+                        <div class="flow-step"><span class="step-node">Server</span><span class="step-msg data">→ fan out</span><span class="step-node">Receiver</span></div>
+                        <div class="flow-label" style="background: rgba(239,68,68,0.1); color: #ef4444; border-color: #ef4444;">Receiver detects gap [2]</div>
+                        <div class="flow-step"><span class="step-node">Receiver</span><span class="step-msg nack">← NACK [2]</span><span class="step-node">Server</span></div>
+                        <div class="flow-step repair"><span class="step-node">Server</span><span class="step-msg data">repairs [2] from cache →</span><span class="step-node">Receiver</span></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="architecture" class="section container">
+            <div class="section-header">
+                <h2>Hybrid Architecture</h2>
+                <p>Bridging the gap between raw UDP hardware performance and universal Web accessibility.</p>
+            </div>
+            
+            <div class="arch-grid">
+                <div class="arch-card">
+                    <h3>Dual-Transport Topology</h3>
+                    <p>Dart handles transport fragmentation natively. The central server maintains a unified peer list, seamlessly routing raw UDP datagrams to native CLI clients, and framed TCP/WebSocket payloads to Browsers and Electron apps, without breaking protocol state. A TCP fallback transport (port 9001) covers high-loss or NAT-traversal cases.</p>
+                </div>
+                <div class="arch-card">
+                    <h3>Blind, Server-Blind Relay</h3>
+                    <p>The server is a pure router: it relays opaque ciphertexts and never holds a conversation key. Membership is public, content is not — the server cannot read a single message, and it fans out the exact same encrypted bytes to every member.</p>
+                </div>
+                <div class="arch-card">
+                    <h3>In-Memory Sliding Window</h3>
+                    <p>For lightning-fast NACK recovery, servers and clients maintain a bounded Sliding Window Cache (max 200 packets per peer). When a gap is detected, packets are pulled directly from RAM — zero database lookups, instantaneous repair.</p>
+                </div>
+                <div class="arch-card">
+                    <h3>Per-Message Ratchet Keys</h3>
+                    <p>Each member generates its own one-way ratchet chain and hands the current state to the group via ECDH-encrypted <code>CHAIN_SHARE</code> — so every message uses a unique derived key and a fresh peer receives no history. If the room creator leaves, the server elects the smallest remaining member, who rotates the keys immediately.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="implementations" class="section container">
+            <div class="section-header">
+                <h2>Interoperable Stack</h2>
+                <p>One protocol, completely implemented across three languages and multiple environments.</p>
+            </div>
+
+            <div class="impl-grid">
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon rust"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Rust Server</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Router</span>
+                                <span class="impl-tag tag-udp">UDP</span>
+                                <span class="impl-tag tag-ws">WS</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>Built on Tokio. Blind relay: tracks public membership and relays opaque ciphertexts without ever holding a group key. Highly concurrent state management via fine-grained RwLocks.</p>
+                    <div class="impl-strength">Strength: Zero-cost abstraction routing.</div>
+                </div>
+
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon go"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.8"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Go Server</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Router</span>
+                                <span class="impl-tag tag-udp">UDP</span>
+                                <span class="impl-tag tag-ws">WS</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>The original reference router. Leverages Goroutines for lightweight concurrency. Seamlessly upgrades HTTP to WebSockets.</p>
+                    <div class="impl-strength">Strength: Massive horizontal scalability.</div>
+                </div>
+
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon rust"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Rust CLI Client</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Terminal</span>
+                                <span class="impl-tag tag-udp">UDP Only</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>Maximum performance client interacting over raw std::net::UdpSocket. Instantaneous hardware-level NACK detection.</p>
+                    <div class="impl-strength">Strength: Bare-metal execution speed.</div>
+                </div>
+
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon go"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="currentColor" opacity="0.8"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Go CLI Client</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Terminal</span>
+                                <span class="impl-tag tag-udp">UDP Only</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>The original protocol testing client. Sends raw UDP datagrams using native Go networking, featuring lightweight goroutines for concurrent listen/send.</p>
+                    <div class="impl-strength">Strength: Simple, highly concurrent I/O.</div>
+                </div>
+
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon ts"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" fill="currentColor"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Electron App</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Desktop UI</span>
+                                <span class="impl-tag tag-udp">Node UDP</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>A native desktop wrapper integrating the web UI with Node's raw dgram UDP stack, completely bypassing browser network limits.</p>
+                    <div class="impl-strength">Strength: Web UX with Native Networking.</div>
+                </div>
+
+                <div class="impl-card">
+                    <div class="impl-header">
+                        <div class="impl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
+                        <div class="impl-title">
+                            <h3>Browser Web App</h3>
+                            <div class="impl-tags">
+                                <span class="impl-tag tag-role">Browser UI</span>
+                                <span class="impl-tag tag-ws">WS</span>
+                            </div>
+                        </div>
+                    </div>
+                    <p>Vanilla JS/CSS client. Uses Web Crypto API for hardware-accelerated AES-GCM decryption entirely inside the browser tab, with the same end-to-end group-key handshake as the native clients.</p>
+                    <div class="impl-strength">Strength: Ubiquitous zero-install access.</div>
+                </div>
+            </div>
+        </section>
+
+        <section id="benchmarks" class="section container">
+            <div class="section-header">
+                <h2>Measured End-to-End</h2>
+                <p>Real clients and real servers, many users, compared against a positive-ACK chat baseline. Reproduce with <code style="color: var(--accent);">npm run bench:endtoend</code>.</p>
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Users</th>
+                            <th>Messages</th>
+                            <th>Packets / msg</th>
+                            <th>vs +ACK Chat</th>
+                            <th>Delivery</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>1:1 fan-out</td>
+                            <td>2</td>
+                            <td>100</td>
+                            <td>2.02</td>
+                            <td><strong class="val-good">−32.7%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>Group fan-out</td>
+                            <td>10</td>
+                            <td>100</td>
+                            <td>11.0</td>
+                            <td><strong class="val-good">−42.1%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>Group fan-out</td>
+                            <td>100</td>
+                            <td>100</td>
+                            <td>115.5</td>
+                            <td><strong class="val-good">−42.0%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>All-to-all chat</td>
+                            <td>10</td>
+                            <td>200</td>
+                            <td>10.95</td>
+                            <td><strong class="val-good">−42.4%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>All-to-all (staggered)</td>
+                            <td>50</td>
+                            <td>1,000</td>
+                            <td>88.0</td>
+                            <td>−11.1%</td>
+                            <td><span class="val-good">99.5%</span></td>
+                        </tr>
+                        <tr>
+                            <td><strong>10% packet loss</strong></td>
+                            <td>10</td>
+                            <td>100</td>
+                            <td>11.71</td>
+                            <td><strong class="val-good">−44.5%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr style="background: rgba(94, 106, 210, 0.05);">
+                            <td><strong>30% packet loss</strong></td>
+                            <td>10</td>
+                            <td>100</td>
+                            <td>13.43</td>
+                            <td><strong class="val-good">−50.5%</strong></td>
+                            <td><span class="val-good">99.7%</span></td>
+                        </tr>
+                        <tr>
+                            <td>Go server</td>
+                            <td>20</td>
+                            <td>100</td>
+                            <td>21.13</td>
+                            <td><strong class="val-good">−45.8%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>Rust server</td>
+                            <td>20</td>
+                            <td>100</td>
+                            <td>21.53</td>
+                            <td><strong class="val-good">−44.8%</strong></td>
+                            <td><span class="val-good">100%</span></td>
+                        </tr>
+                        <tr>
+                            <td>Native Go + Rust clients</td>
+                            <td>4</td>
+                            <td>50</td>
+                            <td>—</td>
+                            <td>—</td>
+                            <td><span class="val-good">100% / 100%</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <p class="method-note">
+                Methodology: real clients and real servers at scale, measured on the wire, compared against a positive-ACK baseline
+                (each message costs <code>1 + (K−1) fan-out + (K−1) ACKs = 2K−1</code> packets, inflated by <code>1/(1−L)</code> for link loss <code>L</code>).
+                Reproduce with <code style="color: var(--accent);">npm run bench:endtoend</code>.
+            </p>
+
+            <div class="chart-card chart-tabs">
+                <input type="radio" name="chart-tab" id="chart-tab-1" class="chart-tab-input" checked />
+                <input type="radio" name="chart-tab" id="chart-tab-2" class="chart-tab-input" />
+                <input type="radio" name="chart-tab" id="chart-tab-3" class="chart-tab-input" />
+
+                <div class="tabs-head">
+                    <label for="chart-tab-1">Packet savings vs group size</label>
+                    <label for="chart-tab-2">Savings grow with packet loss</label>
+                    <label for="chart-tab-3">100 messages, 1:1 — total packets</label>
+                </div>
+
+                <div class="tabs-body">
+                    <div class="tab-panel panel-1">
+                        <div class="chart-inner">
+                            <svg class="chart-svg" viewBox="0 0 760 380" role="img" aria-label="Bar chart. One-to-one chat saves 32.7 percent of packets, ten users saves 42.1 percent, one hundred users saves 42.0 percent, trending toward the fifty percent theoretical ceiling.">
+                                <line class="grid" x1="90" y1="75" x2="720" y2="75" />
+                                <line class="grid" x1="90" y1="120" x2="720" y2="120" />
+                                <line class="grid" x1="90" y1="165" x2="720" y2="165" />
+                                <line class="grid" x1="90" y1="210" x2="720" y2="210" />
+                                <line class="grid" x1="90" y1="255" x2="720" y2="255" />
+                                <line class="ceiling" x1="90" y1="75" x2="720" y2="75" />
+                                <text class="tick" x="80" y="79">50%</text>
+                                <text class="tick" x="80" y="124">40%</text>
+                                <text class="tick" x="80" y="169">30%</text>
+                                <text class="tick" x="80" y="214">20%</text>
+                                <text class="tick" x="80" y="259">10%</text>
+                                <text class="axis-label" x="90" y="26" text-anchor="start">packets saved (%)</text>
+
+                                <rect class="bar-dart" x="155" y="152.85" width="120" height="147.15" rx="5" />
+                                <rect class="bar-dart" x="345" y="110.55" width="120" height="189.45" rx="5" />
+                                <rect class="bar-dart" x="535" y="111" width="120" height="189" rx="5" />
+
+                                <text class="value" x="215" y="143" text-anchor="middle">32.7%</text>
+                                <text class="value" x="405" y="100" text-anchor="middle">42.1%</text>
+                                <text class="value" x="595" y="101" text-anchor="middle">42.0%</text>
+
+                                <text class="axis-label" x="215" y="335" text-anchor="middle">1:1 (2 users)</text>
+                                <text class="axis-label" x="405" y="335" text-anchor="middle">10 users</text>
+                                <text class="axis-label" x="595" y="335" text-anchor="middle">100 users</text>
+                                <text class="tick" x="405" y="66" text-anchor="middle">theoretical ≈50% ceiling</text>
+                            </svg>
+                        </div>
+                    </div>
+
+                    <div class="tab-panel panel-2">
+                        <div class="chart-inner">
+                            <svg class="chart-svg" viewBox="0 0 760 380" role="img" aria-label="Line chart. Packet savings increase with packet loss: 42.1 percent at zero loss, 44.5 percent at ten percent loss, 50.5 percent at thirty percent loss.">
+                                <line class="grid" x1="100" y1="97.5" x2="720" y2="97.5" />
+                                <line class="grid" x1="100" y1="165" x2="720" y2="165" />
+                                <line class="grid" x1="100" y1="232.5" x2="720" y2="232.5" />
+                                <text class="tick" x="90" y="101">50%</text>
+                                <text class="tick" x="90" y="169">45%</text>
+                                <text class="tick" x="90" y="236">40%</text>
+                                <text class="axis-label" x="100" y="26" text-anchor="start">packets saved (%)</text>
+
+                                <path class="area" d="M190,300 L190,204.15 L390,171.75 L590,90.75 L590,300 Z" />
+                                <path class="line" d="M190,204.15 L390,171.75 L590,90.75" />
+                                <circle class="point" cx="190" cy="204.15" r="6" />
+                                <circle class="point" cx="390" cy="171.75" r="6" />
+                                <circle class="point" cx="590" cy="90.75" r="6" />
+
+                                <text class="value" x="190" y="190" text-anchor="middle">42.1%</text>
+                                <text class="value" x="390" y="157" text-anchor="middle">44.5%</text>
+                                <text class="value" x="590" y="76" text-anchor="middle">50.5%</text>
+
+                                <text class="axis-label" x="190" y="335" text-anchor="middle">0% loss</text>
+                                <text class="axis-label" x="390" y="335" text-anchor="middle">10% loss</text>
+                                <text class="axis-label" x="590" y="335" text-anchor="middle">30% loss</text>
+                                <text class="axis-label" x="405" y="358" text-anchor="middle">Link packet loss</text>
+                            </svg>
+                        </div>
+                    </div>
+
+                    <div class="tab-panel panel-3">
+                        <div class="chart-inner">
+                            <div class="bar-chart">
+                                <div class="bar-row">
+                                    <div class="bar-label">Dart Protocol</div>
+                                    <div class="bar-track">
+                                        <div class="bar-fill dart" style="width: 67%;">202 Packets</div>
+                                    </div>
+                                </div>
+                                <div class="bar-row">
+                                    <div class="bar-label">Positive-ACK</div>
+                                    <div class="bar-track">
+                                        <div class="bar-fill tcp" style="width: 100%;">300 Packets</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <p style="text-align: center; color: var(--text-muted); font-size: 0.9rem; margin-top: 1.25rem;">
+                                The 98 saved packets are the ACKs Dart never sends.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bench-summary">
+                <div class="bench-box">
+                    <h4><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--success);"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> Where Dart Wins</h4>
+                    <p>Steady state, Dart sends <strong>~33–48% fewer packets</strong> than a positive-ACK chat, converging toward the ~50% ceiling as groups grow — it sends zero ACKs per message where the baseline sends one per receiver. <strong>The gain grows with loss</strong> (44% at 10% → 50% at 30%): a NACK-only model costs less than ACK + retransmit once the link degrades.</p>
+                </div>
+                <div class="bench-box">
+                    <h4><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--success);"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Reliability</h4>
+                    <p><strong>~100% delivery</strong> at 0–10% loss and 99.7% at 30% loss across every server (TS, Go, Rust) and both native clients, verified with 100–user rooms. Lost packets are repaired from the server's in-memory sliding-window cache — no database, no full re-sync.</p>
+                </div>
+                <div class="bench-box">
+                    <h4><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--warning);"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> Honest Limits</h4>
+                    <p>A <em>synchronized</em> 50-sender burst saturates the single-threaded client receive path (UDP socket overflow); the realistic staggered pattern recovers to 99.5% — a client-throughput limit, not a protocol failure. Joining a room is O(N²) membership traffic, and WebSocket clients still inherit TCP's head-of-line blocking (the V2 WebTransport roadmap fixes that).</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="security" class="section container">
+            <div class="section-header">
+                <h2>Cryptographic Core</h2>
+                <p>The relay server is blind. Ratchet chains and control keys are generated by members and shared member-to-member — never seen by the server.</p>
+            </div>
+            <div class="feature-grid">
+                <div class="feature-item">
+                    <h4>Per-Message Ratchet (Sender Keys)</h4>
+                    <p>Every message is encrypted under a key derived from its sender's one-way ratchet chain — a compromised message key decrypts only that one message, and a compromised chain state reveals <em>future but not past</em> messages. Chains are shared member-to-member via ECDH-encrypted <code>CHAIN_SHARE</code>, relayed opaquely by the server.</p>
+                </div>
+                <div class="feature-item">
+                    <h4>Epoch Rotation + Successor Election</h4>
+                    <p>Chains and control keys carry an epoch; the creator rotates them on a timer and when a member leaves, bounding any compromise. If the creator leaves, the server elects the smallest remaining senderId as successor, who rotates immediately — key rotation survives the creator.</p>
+                </div>
+                <div class="feature-item">
+                    <h4>AES-256-GCM + Random Nonces</h4>
+                    <p>Every packet is encrypted and authenticated with AES-256-GCM under a fresh per-message key with a random 12-byte nonce — no nonce reuse, no implicit-IV collisions. Data darts also carry a dictionary fingerprint so loss recovery is deterministic.</p>
+                </div>
+                <div class="feature-item">
+                    <h4>Per-Sender Control-Frame Authentication</h4>
+                    <p>ACK/NACK are authenticated with an ECDH-derived per-sender key and verified by the target member; SYNC/Dict Reset are keyed to the relay server and verified before relaying. A group member can no longer forge another member's control frames.</p>
+                </div>
+                <div class="feature-item">
+                    <h4>Server Key Pinning</h4>
+                    <p>Servers persist a long-term ECDH identity key and print its SHA-256 fingerprint. Clients pin it and abort if the roster's server key doesn't match — blocking man-in-the-middle substitution.</p>
+                </div>
+                <div class="feature-item">
+                    <h4>Bounded Compression Dictionary</h4>
+                    <p>Delta compression uses a deterministic 200-message per-sender window with a 4-byte SHA-256 fingerprint in every header, so desyncs are detected before inflation and recovered in one step — with bounded client memory.</p>
+                </div>
+            </div>
+        </section>
+        <section id="docs" class="section container">
+            <div class="section-header">
+                <h2>Specification & Test Coverage</h2>
+                <p>The protocol is fully documented and the wire format is locked down by cross-language unit tests.</p>
+            </div>
+            <div class="arch-grid">
+                <div class="arch-card">
+                    <h3>Wire Specification</h3>
+                    <p><code>PROTOCOL.md</code> documents every frame type, the per-sender ratchet derivation, per-sender control-frame authentication, and the reliability state machine.</p>
+                    <a href="docs.html?f=PROTOCOL.md" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem;">Read PROTOCOL.md</a>
+                </div>
+                <div class="arch-card">
+                    <h3>Security Model</h3>
+                    <p><code>SECURITY.md</code> covers the threat model, per-message ratchet guarantees, known limitations, and the recommended deployment posture.</p>
+                    <a href="docs.html?f=SECURITY.md" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem;">Read SECURITY.md</a>
+                </div>
+                <div class="arch-card">
+                    <h3>Cross-Language Tests</h3>
+                    <p><code>go test ./core/</code> and <code>cargo test</code> verify codec round-trips and golden wire vectors generated from the TS reference — byte-identical framing across TypeScript, Go and Rust.</p>
+                    <a href="docs.html?f=README.md" class="btn btn-secondary btn-sm" style="margin-top: 0.75rem;">Read README.md</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="status" class="section container">
+            <div class="section-header">
+                <h2>Where It Stands</h2>
+                <p>Honest status: what works today, what's deliberately next.</p>
+            </div>
+            <div class="bench-summary">
+                <div class="bench-box">
+                    <h4><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--success);"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> Working Today</h4>
+                    <p>Real E2EE with a per-message ratchet on a server-blind relay, per-sender control-frame authentication, successor-driven key rotation that survives the creator leaving, 24-bit sequence-wrap handling, NACK-only reliability, bounded dictionary compression with fingerprint recovery, server key pinning, TCP fallback, and verified interoperability across TypeScript, Go and Rust — backed by codec round-trip and cross-language wire-vector unit tests in Go and Rust.</p>
+                </div>
+                <div class="bench-box">
+                    <h4><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--warning);"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg> Next Up (Roadmap)</h4>
+                    <p>Real PKI instead of fingerprint pinning, browser WebTransport for true UDP in the browser (<a href="v2.html" style="color: var(--accent);">V2</a>), and — as a separate architecture — P2P mesh routing to hide conversation metadata.</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container footer-content">
+            <div class="footer-brand">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
+                </svg>
+                Dart Protocol
+            </div>
+            <div class="footer-meta">
+                Experimental Open Source — E2EE · Server-Blind · Three Languages
+            </div>
+        </div>
+    </footer>
+
+    <script src="js/main.js"></script>
+</body>
+</html>
